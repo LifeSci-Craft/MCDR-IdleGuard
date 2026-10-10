@@ -1,0 +1,7 @@
+# 源码与文档统一 LF（打包器也要求文本统一成 LF，两边保持一致）
+* text=auto eol=lf
+
+# 构建产物按二进制处理，别做换行转换
+*.mcdr binary
+*.jar binary
+*.zip binary
