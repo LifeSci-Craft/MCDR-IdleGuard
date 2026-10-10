@@ -1,0 +1,14 @@
+# MCDR 与 Python 的运行时垃圾
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 本地工具链与运行数据（不进仓库）
+.workbuddy/
+.venv/
+venv/
+logs/
+*.log
+
+# 构建中间产物
+dist/
