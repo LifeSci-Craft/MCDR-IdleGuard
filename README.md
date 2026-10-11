@@ -219,9 +219,13 @@ survival 已休眠
 
 ### 文案
 
-玩家看到的文字都在 `lang/zh_cn.json` / `lang/en_us.json` 里。想改某一句又不动插件本体，
-就在 `config/idle_guard/lang/zh_cn.json` 里只写要改的键（与内置文件合并，同键以你的为准），
-这个目录升级不会覆盖。键名可以对照插件包的 `lang/en_us.json` 查找。
+玩家看到的文字都**打包在插件里**（`idle_guard/lang/zh_cn.json` 与 `lang/en_us.json`），
+`config.json` 里没有任何一句文案（`language` 只是"用哪种语言"的开关）。
+
+想改某一句又不动插件本体，可以加一层可选的覆盖：在 MCDR 给本插件的数据目录
+（`config/idle_guard/`，`config.json` 也在这里）下建 `lang/zh_cn.json`，只写要改的键即可。
+插件启动时先读内置文件、再用这份覆盖同名键。**不建这个目录就完全用内置文案**，
+插件自己不会创建也不会修改它，升级也不会覆盖。键名对照插件包的 `lang/en_us.json` 查找。
 
 ## 注意
 
