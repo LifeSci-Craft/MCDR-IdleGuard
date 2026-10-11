@@ -17,6 +17,7 @@ Minecraft Java 版协议的最小实现（只覆盖本插件需要的部分）
 from __future__ import annotations
 
 import json
+import os
 import socket
 import struct
 import time
@@ -281,13 +282,25 @@ def port_open(host: str, port: int, timeout: float = 1.0) -> bool:
         return False
 
 
-def can_bind(host: str, port: int) -> bool:
-    """测试本机能否绑定该端口（用于判断真实服务端是否已经彻底释放端口）。"""
+def bind_error(host: str, port: int) -> Optional[OSError]:
+    """试着在本机绑定该端口：能绑返回 None，不能绑则返回那个 OSError（带 errno 便于排查）。
+
+    ⚠️ 这个结果**不能**拿来判断「端口空出来了吗」：端口上只要残留一条 TIME_WAIT
+    （每次客户端正常断开都会留下一条），bind 就会报 EADDRINUSE —— 实测在 POSIX 上
+    连 SO_REUSEADDR 都救不了（那个标志解决的是"与另一个 socket 共用地址"的协商，
+    并不解除 TIME_WAIT 的占用）。所以它只当排查时的诊断信息用，正式判据是
+    `port_open`（「还有没有人在监听」，TIME_WAIT 骗不到它）。
+
+    POSIX 上仍然设 SO_REUSEADDR，与 `fakeserver` / `bus` 保持一致；Windows 上不设 ——
+    那边的语义是"允许抢一个正在监听的端口"，会让探测恒为"能绑"。
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        if os.name != 'nt':
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((host, port))
-        return True
-    except OSError:
-        return False
+        return None
+    except OSError as exc:
+        return exc
     finally:
         sock.close()

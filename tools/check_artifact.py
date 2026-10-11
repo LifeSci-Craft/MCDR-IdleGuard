@@ -41,8 +41,9 @@ PLUGIN_ID = build.PLUGIN_ID
 #: 允许出现在包里的条目（其余一律视为打包器 bug）。代码/数据在 PLUGIN_ID/ 目录下。
 EXPECTED_ROOT = {'mcdreforged.plugin.json'}
 EXPECTED_MEMBERS = {'CHANGELOG.md', 'LICENSE', 'requirements.txt', '__init__.py', 'bus.py',
-                    'commands.py', 'config.py', 'fakeserver.py', 'i18n.py', 'mcproto.py',
-                    'supervisor.py', 'ui.py', 'lang/en_us.json', 'lang/zh_cn.json'}
+                    'commands.py', 'config.py', 'diag.py', 'fakeserver.py', 'i18n.py', 'mcproto.py',
+                    'models.py', 'remote.py', 'stats.py', 'supervisor.py', 'takeover.py', 'ui.py',
+                    'velocity.py', 'lang/en_us.json', 'lang/zh_cn.json'}
 
 #: 绝不能出现的根级条目：MCDR 拒绝加载带根级模块的包，这些不是"不整齐"而是"装了不能用"
 FORBIDDEN_ROOTS = ('README.md', 'README-dev.md', 'pack.py', 'conftest.py', 'pytest.ini',

@@ -1,4 +1,4 @@
-"""两条线上反馈的回归测试（v1.0.0）。
+"""两条线上反馈的回归测试。
 
 **反馈 1：玩家退了，插件还认为他在线 → `!!ig sleep` 被一直拒绝、空闲计时根本不开始。**
 
@@ -28,6 +28,8 @@
 修法：转后台之前**同步**调用 `precheck_sleep`，把拒绝理由当场答回去。
 """
 from __future__ import annotations
+
+import os
 
 import idle_guard.supervisor as supervisor_module
 from idle_guard.config import AnnounceConfig, BusConfig, Config, FakeServerConfig, ServerEntry
@@ -378,7 +380,11 @@ def test_precheck_sleep_agrees_with_sleep_server_when_someone_is_inside():
 
 
 def test_module_still_has_no_third_party_imports():
-    """顺手确认没引入新依赖（插件是纯 Python 零依赖的）。"""
-    source = open(supervisor_module.__file__, encoding='utf-8').read()
-    for forbidden in ('import requests', 'import aiohttp', 'import numpy'):
-        assert forbidden not in source
+    """顺手确认没引入新依赖（插件是纯 Python 零依赖的）—— 拆过模块之后要查整个包。"""
+    package_dir = os.path.dirname(supervisor_module.__file__)
+    for name in sorted(os.listdir(package_dir)):
+        if not name.endswith('.py'):
+            continue
+        source = open(os.path.join(package_dir, name), encoding='utf-8').read()
+        for forbidden in ('import requests', 'import aiohttp', 'import numpy'):
+            assert forbidden not in source, f'{name} 里出现了第三方依赖：{forbidden}'
