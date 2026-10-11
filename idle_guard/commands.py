@@ -43,9 +43,12 @@ from . import ui
 from .supervisor import MANAGED_ROLES, ServerView, State, Supervisor
 
 #: 命令权限级别（MCDR：0=guest 1=user 2=helper 3=admin 4=owner）
-#: 按用户要求，`!!ig` 的**全部**命令默认只有管理员能用（含 !!) 帮助与 status）。
-#: 想给普通玩家或 helper 放开某条命令：改这里的数字，或在 MCDR 的 `permission.yml`
-#: 里针对 `idle_guard` 的对应节点单独给权限（后者不用改插件）。
+#: 按用户要求，`!!ig` 的**全部**命令默认只有管理员能用（含帮助与 status）。
+#: 想放宽只有两条路，都不是改 `permission.yml` 的节点：
+#:   ① 想让某条命令对更低等级开放 —— 改这里的数字（会改变所有实例的行为）；
+#:   ② 想让某个玩家能用 —— 在 MCDR 的 `permission.yml` 里把他的等级提到 admin
+#:      （`permission.yml` 只有玩家到等级的映射，没有节点级权限覆盖）。
+#:   注意玩家名**大小写敏感**、精确匹配（MCDR `permission_manager.py`），名字写错会退回 default_level。
 PERM_STATUS = 3      # 根命令与 help / status
 PERM_CONTROL = 3     # wake / sleep / lock / unlock / confirm / cancel
 PERM_ADMIN = 3       # poll / reload

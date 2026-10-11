@@ -68,7 +68,8 @@
 
 ## 命令
 
-需要 MCDR 权限等级 3（可配置）。`!!ig` 与 `!!idleguard` 等价；不带子命令打开帮助页。
+全部子命令都需要 **MCDR 权限等级 3（ADMIN）**，包括帮助页与 `status`。等级不足时由 MCDR 直接回
+`权限不足`，请求不会到达插件。`!!ig` 与 `!!idleguard` 等价；不带子命令打开帮助页。
 
 | 命令 | 作用 |
 |---|---|
@@ -237,6 +238,9 @@ survival 已休眠
 - MCDR 必须常驻：它一关，假服务端也就没了。另注意 MCDR 2.x 的 `!!MCDR stop` 在控制台无效，
   停服用 `stop`。
 - Windows 上第一次接管端口时可能弹防火墙授权框，需要允许，否则玩家连接会被系统丢包。
+- **权限**：命令门槛固定为 MCDR 等级 3（ADMIN），`config.json` 里没有权限开关。要放行某人就在
+  MCDR 的 `permission.yml` 里把他的名字填进 `owner`/`admin`。⚠️ 那里的玩家名**大小写敏感**且精确匹配
+  （`Paulam` ≠ `PaulAm`），写错会退回 `default_level`，表现为「明明配了却提示权限不足」。
 
 ## License
 
