@@ -17,6 +17,7 @@ Minecraft Java 版协议的最小实现（只覆盖本插件需要的部分）
 from __future__ import annotations
 
 import json
+import os
 import socket
 import struct
 import time
@@ -282,9 +283,18 @@ def port_open(host: str, port: int, timeout: float = 1.0) -> bool:
 
 
 def can_bind(host: str, port: int) -> bool:
-    """测试本机能否绑定该端口（用于判断真实服务端是否已经彻底释放端口）。"""
+    """测试本机能否绑定该端口（用于判断真实服务端是否已经彻底释放端口）。
+
+    POSIX 上要开 SO_REUSEADDR：端口上残留的 TIME_WAIT（刚断开的那次状态查询、
+    假服务端撤下前的连接）会让 bind 失败，被误判成"服务端还没退干净"，唤醒流程
+    就会一直等到超时。开了之后仍然绑不上**正在监听**的端口，判断依旧可靠。
+    Windows 上不能开 —— 那里的 SO_REUSEADDR 允许抢占仍在监听的端口，
+    会让这个探测恒为 True，反而失去意义（与 fakeserver / bus 保持一致）。
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        if os.name != 'nt':
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((host, port))
         return True
     except OSError:
