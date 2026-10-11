@@ -94,8 +94,14 @@
 
 ## 状态与角色
 
-状态取值：`unknown` / `offline` / `starting` / `running` / `stopping` / `sleeping`。
+状态取值：`unknown` / `offline` / `starting` / `running` / `stopping` / `sleeping` / `stopped`。
 本实例负责的子服由轮询与事件维护，其余子服以状态查询结果为准。
+
+`stopped` 与 `sleeping` 的区别（别混）：`sleeping` 是**插件自己**让它睡的，假服务端占着端口，
+玩家连接会唤醒；`stopped` 是**外部**停的（后台敲 `stop`、服务端自己优雅退出），插件不接管端口、
+也不会替玩家开服。判定依据是服务端的退出码：0 记 `stopped`，非 0（崩溃 / 被强杀）才走
+"假服务端接管 + 留住 MCDR"的兜底。服务端重新起来（`on_server_startup`）或插件明确休眠 / 唤醒时，
+`external_stop` 标记清掉，恢复托管。
 
 角色的含义（`role`）：`self` = 本实例用 MCDR 启停；`command` = 本实例用命令启停；
 `watch` = 只监视；`auto` = 按 `server.properties` 端口自动判定。前两者才是 `MANAGED_ROLES`。
@@ -136,9 +142,11 @@
   漏掉 `execute at` 时声源落在世界原点，玩家离得远就听不见。
 - **启动耗时落盘复用**：本次实测 → 上次存盘 `config/idle_guard/startup_seconds.json` →
   `fallback_startup_seconds`，插件重载或 MCDR 重启都不会退回兜底值。
-- **服务端意外停止时要阻止 MCDR 退出**：MCDR 每次启动服务端都会打上 `EXIT_AFTER_STOP`,
-  非插件方式停服会让 MCDR 跟着退出、假服务端一起消失。`on_server_stop` 的意外分支里调
-  `set_exit_after_stop_flag(False)`。
+- **停止要分「正常」与「异常」两路**：`on_server_stop` 按退出码分流：0（后台 `stop`、服务端自己
+  优雅退出）记 `stopped`，不接管端口、不动 `EXIT_AFTER_STOP` 标记（管理员就是想用 `stop` 把实例关掉）；
+  非 0（崩溃 / 被强杀）才调 `set_exit_after_stop_flag(False)` 留住 MCDR，并让假服务端接管端口、
+  等玩家连接时自动开服。轮询每 tick 都会重算状态，所以这个结论必须由 `ManagedServer.external_stop`
+  这个标记承载，否则下一次心跳又会把它推成 `offline` → 假服务端 → `sleeping`。
 - **空闲计时与 `auto_sleep` 解耦**：`_check_idle` 照常维护 `empty_since`（浮窗要显示），
   只有 `role in MANAGED_ROLES and auto_sleep and not locked` 时才真的关服。
 

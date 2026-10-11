@@ -39,8 +39,9 @@ from .mcproto import PingResult, can_bind, port_open, status_ping
 
 class State(str, Enum):
     UNKNOWN = 'unknown'
-    OFFLINE = 'offline'      # 服务端未运行，且端口无人接管
+    OFFLINE = 'offline'      # 服务端未运行，且端口无人接管（过渡态：插件随时会挂上假服务端）
     SLEEPING = 'sleeping'    # 已休眠：服务端停止 + 假服务端顶替端口
+    STOPPED = 'stopped'      # 被手动/外部停止：服务端未运行，且**插件不接管端口**
     STARTING = 'starting'
     RUNNING = 'running'
     STOPPING = 'stopping'
@@ -98,6 +99,10 @@ class ManagedServer:
         self.players_seen_at = 0.0
         self.slp = PingResult()
         self.fake: Optional[FakeServer] = None
+        #: 这台服是被**外部**停掉的（后台敲 `stop`、别的程序关的、崩了之后被关的），
+        #: 而不是插件自己休眠 —— 这种"已停止"插件不接管端口、也不会替玩家自动开服。
+        #: 服务端重新起来、或插件明确要休眠/唤醒时清掉。
+        self.external_stop = False
         self.attempts: Dict[str, float] = {}
 
         self.action_lock = threading.RLock()
@@ -576,7 +581,13 @@ class Supervisor:
                     managed.started_at = now
                     managed.empty_since = None
             else:
-                new_state = State.SLEEPING if (managed.fake and managed.fake.running) else State.OFFLINE
+                if managed.external_stop:
+                    # 被后台 stop 关掉的：这是"已停止"，插件不接管端口（否则又变成"休眠"）
+                    new_state = State.STOPPED
+                elif managed.fake and managed.fake.running:
+                    new_state = State.SLEEPING
+                else:
+                    new_state = State.OFFLINE
             self._set_state(managed, new_state)
         else:
             if managed.slp.online and not managed.slp.is_fake:
@@ -651,7 +662,9 @@ class Supervisor:
         managed.state_since = time.monotonic()
         if detail:
             managed.detail = detail
-        elif state not in (State.OFFLINE, State.UNKNOWN):
+        elif state not in (State.OFFLINE, State.UNKNOWN, State.STOPPED):
+            # OFFLINE / UNKNOWN / STOPPED 保留上一次的说明：心跳每几秒就重设一次状态，
+            # 若在这里清空，玩家在浮窗里就再也看不到"为什么没跑"了
             managed.detail = ''
         if old != state:
             self._logger.info(f'{managed.name}: {old.value} -> {state.value}'
@@ -674,6 +687,9 @@ class Supervisor:
         need_fake = (
             self._config.fake_server.enabled
             and managed.entry.auto_wake
+            # 被外部正常停掉的服不算"该接管"：管理员自己关的就是关了，
+            # 端口挂个假服务端上去会把"已停止"又变成"已休眠"
+            and not managed.external_stop
             # STOPPING 也算：服务端正在退出的那几秒里就该开始抢端口，
             # 一等到端口释放立刻接管（玩家能连上的时间窗越短越好）
             and managed.state in (State.STOPPING, State.SLEEPING, State.OFFLINE)
@@ -1117,6 +1133,9 @@ class Supervisor:
         with managed.action_lock, self._action(managed):
             if self._stopping.is_set():
                 return
+            # 本实例要把它重新管起来了（下面是"启服务端 / 接管端口"的动作），
+            # 之前那次"被外部停止"的结论作废
+            managed.external_stop = False
             self._set_state(managed, State.STARTING, self.tr('detail.wake_reason', reason=reason, by=by))
             self._announce(self.tr(
                 'announce.waking',
@@ -1532,6 +1551,8 @@ class Supervisor:
             if managed.role != 'self':
                 continue
             managed.startup_event.set()
+            # 服务端起来了 —— 之前那次"被外部停止"的结论作废，本实例重新接管它
+            managed.external_stop = False
             # MCDR 都说了"启动完成"，状态就没必要再等下一轮心跳/侦察（线上反馈：
             # 服务端明明开好了，状态表还显示"启动中"好几分钟）
             if not managed.action_in_progress and managed.state != State.RUNNING:
@@ -1552,9 +1573,26 @@ class Supervisor:
                 if managed.state == State.STOPPING:
                     # sleep_server 会接着做后续处理
                     continue
-                # 非预期停止（崩溃 / 手动 / 外部因素）：立刻让假服务端接管，等待玩家唤醒
+                if return_code == 0:
+                    # 正常退出（后台敲 stop、或服务端自己优雅退出）——这是"已停止"，不是"休眠"。
+                    # 插件不接管端口，也不阻止 MCDR 按默认行为随服务端一起退出：
+                    # 以前这里一律当"意外停止"处理，于是 stop 之后端口被假服务端占住、
+                    # 状态显示"已休眠"、MCDR 还被强行留住，管理员发现 stop 关不掉了。
+                    self._logger.info(f'{managed.name}: 服务端被正常停止（返回码 0），'
+                                      f'按"已停止"处理 —— 插件不接管端口，'
+                                      f'玩家连接不会被自动开服（要休眠请用 !!ig sleep）')
+                    managed.external_stop = True
+                    if managed.fake is not None and managed.fake.running:
+                        managed.fake.stop()
+                    self._set_state(managed, State.STOPPED,
+                                    self.tr('detail.server_stopped_manual', code=return_code))
+                    if self._config.announce.enabled:
+                        self._announce(self.tr('announce.stopped_manual', server=managed.name))
+                    continue
+                # 异常退出（崩溃 / 被外部强杀）：立刻让假服务端接管，等待玩家唤醒
                 self._logger.warning(f'{managed.name} 意外停止（返回码 {return_code}），'
                                      f'将保持休眠状态，有人连接时自动启动')
+                managed.external_stop = False
                 self._keep_mcdr_alive(managed)
                 self._set_state(managed, State.OFFLINE,
                                 self.tr('detail.server_stopped', code=return_code))

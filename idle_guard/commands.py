@@ -60,6 +60,7 @@ _STATE_COLOURS = {
     State.STARTING.value: RColor.yellow,
     State.STOPPING.value: RColor.yellow,
     State.OFFLINE.value: RColor.red,
+    State.STOPPED.value: RColor.red,
     State.UNKNOWN.value: RColor.gray,
 }
 _ROLE_COLOURS = {
@@ -88,6 +89,7 @@ _SWITCH_ACTIONS = {
     State.RUNNING.value: ('sleep', 'switch_sleep', RColor.red),
     State.SLEEPING.value: ('wake', 'switch_wake', RColor.green),
     State.OFFLINE.value: ('wake', 'switch_wake', RColor.green),
+    State.STOPPED.value: ('wake', 'switch_wake', RColor.green),
 }
 
 
@@ -432,7 +434,7 @@ def _precheck_message(action: str, state: str, view: ServerView, tr, name: str):
     """当前状态已经让这个动作没有意义时，给出要说的话；否则返回 None。"""
     busy = tr('command.action.busy', server=name, state=tr(f'state.{state}'))
     if action == 'sleep':
-        if state in (State.SLEEPING.value, State.OFFLINE.value):
+        if state in (State.SLEEPING.value, State.OFFLINE.value, State.STOPPED.value):
             return tr('action.sleep_not_needed', server=name, state=tr(f'state.{state}')), RColor.gray
         if state in (State.STARTING.value, State.STOPPING.value):
             return busy, RColor.yellow
