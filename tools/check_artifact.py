@@ -42,7 +42,8 @@ PLUGIN_ID = build.PLUGIN_ID
 EXPECTED_ROOT = {'mcdreforged.plugin.json'}
 EXPECTED_MEMBERS = {'CHANGELOG.md', 'LICENSE', 'requirements.txt', '__init__.py', 'bus.py',
                     'commands.py', 'config.py', 'fakeserver.py', 'i18n.py', 'mcproto.py',
-                    'supervisor.py', 'ui.py', 'lang/en_us.json', 'lang/zh_cn.json'}
+                    'supervisor.py', 'ui.py', 'velocity.py',
+                    'lang/en_us.json', 'lang/zh_cn.json'}
 
 #: 绝不能出现的根级条目：MCDR 拒绝加载带根级模块的包，这些不是"不整齐"而是"装了不能用"
 FORBIDDEN_ROOTS = ('README.md', 'README-dev.md', 'pack.py', 'conftest.py', 'pytest.ini',

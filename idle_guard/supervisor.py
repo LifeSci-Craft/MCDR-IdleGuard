@@ -31,6 +31,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from mcdreforged.api.types import PluginServerInterface
 
 from . import i18n
+from . import velocity as velocity_module
 from .bus import Bus
 from .config import Config, ServerEntry
 from .fakeserver import FakeServer
@@ -167,6 +168,8 @@ class ServerView:
     locked: bool = False
     #: 这台子服是否参与自动休眠（浮窗里要说明"空闲但不关"的原因）
     auto_sleep: bool = True
+    #: 常驻：永不休眠（自动与手动都拒绝）
+    always_on: bool = False
     detail: str = ''
     instance: str = ''
     local: bool = False
@@ -177,6 +180,7 @@ class ServerView:
             'state': self.state, 'players': self.players, 'players_max': self.players_max,
             'idle_seconds': self.idle_seconds, 'idle_timeout': self.idle_timeout,
             'locked': self.locked, 'auto_sleep': self.auto_sleep, 'detail': self.detail,
+            'always_on': self.always_on,
         }
 
     @classmethod
@@ -193,6 +197,7 @@ class ServerView:
                 setattr(view, key, float(data[key]))
         view.locked = bool(data.get('locked', False))
         view.auto_sleep = bool(data.get('auto_sleep', True))
+        view.always_on = bool(data.get('always_on', False))
         view.instance = instance
         return view
 
@@ -239,6 +244,8 @@ class Supervisor:
             except re.error as exc:
                 self._logger.warning(f'ignore_players 中的正则 {pattern!r} 无效：{exc}')
 
+        # 先按 velocity.toml 补齐子服清单，再做角色判定（判 role=auto 要靠这些条目）
+        self._sync_servers_from_velocity()
         self._compile_config()
         self._bus_bind = self._resolve_bus_bind()
         self._bus = Bus(
@@ -328,6 +335,57 @@ class Supervisor:
         return None
 
     # ================================================================== 配置解析
+
+    def _sync_servers_from_velocity(self) -> None:
+        """按 `velocity.toml` 的 `[servers]` 段补齐子服清单（**只补缺的**）。
+
+        为什么只补不改：`servers[]` 里那些 `role` / `auto_sleep` / `bus` 是管理员按本机情况
+        手写的，自动同步不该动它们；地址对不上时只提醒一句，不覆盖。
+        """
+        setting = (self._config.velocity_config or '').strip()
+        if setting.lower() in velocity_module.OFF_VALUES:
+            return
+        try:
+            path, found = velocity_module.load_servers(setting, os.getcwd())
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning(f'读取 Velocity 配置出错（跳过同步）：{type(exc).__name__}: {exc}')
+            return
+        if path is None:
+            self._logger.debug(f'没找到 velocity.toml（velocity_config={setting!r}），跳过子服同步')
+            return
+        if not found:
+            self._logger.info(f'读到了 {path}，但里面没有可用的 [servers] 条目，跳过同步')
+            return
+
+        known = {entry.name: entry for entry in self._config.servers}
+        added: List[str] = []
+        for name, (host, port) in sorted(found.items()):
+            entry = known.get(name)
+            if entry is None:
+                self._config.servers.append(ServerEntry(name=name, host=host, port=port))
+                added.append(name)
+            elif entry.port != port or entry.host != host:
+                self._logger.warning(
+                    f'配置里 {name} 写的是 {entry.host}:{entry.port}，'
+                    f'而 {os.path.basename(path)} 里是 {host}:{port}；保留你的配置，'
+                    f'想跟着 Velocity 走就改掉这一条'
+                )
+        if not added:
+            self._logger.debug(f'velocity.toml 里的 {len(found)} 个子服都已在配置中')
+            return
+        self._logger.info(f'已从 {path} 补进 {len(added)} 个子服：{", ".join(added)}')
+        self._save_config()
+
+    def _save_config(self) -> None:
+        """把当前配置写回 config.json（自动补过子服时用，好让管理员看得见改动）。"""
+        if self._data_dir is None:
+            return
+        path = os.path.join(self._data_dir, 'config.json')
+        try:
+            with open(path, 'w', encoding='utf-8') as handle:
+                json.dump(self._config.serialize(), handle, ensure_ascii=False, indent=4)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning(f'配置写回失败（不影响本次运行）：{type(exc).__name__}: {exc}')
 
     def _compile_config(self) -> None:
         """把配置解析成运行时结构：判定 role、建立 ManagedServer、确定实例名。"""
@@ -537,6 +595,7 @@ class Supervisor:
         )
         ping = ping or PingResult()
         view.auto_sleep = bool(entry.auto_sleep)
+        view.always_on = bool(entry.always_on)
         if managed is not None:
             view.state = managed.state.value
             view.locked = managed.locked
@@ -822,7 +881,8 @@ class Supervisor:
 
         timeout = managed.idle_timeout or self._config.idle_timeout
         sleep_allowed = (managed.role in MANAGED_ROLES
-                         and managed.entry.auto_sleep and not managed.locked)
+                         and managed.entry.auto_sleep and not managed.locked
+                         and not managed.entry.always_on)
         if not sleep_allowed:
             managed.warned = False
             return                      # 只计时，不管服（浮窗里仍然能看到空闲多久）
@@ -916,7 +976,11 @@ class Supervisor:
         用户要求：**不能休眠还有玩家的服务器**（手动指令也拒绝）。计数不可信时同样不放行 ——
         `_effective_players` 在"事件说没人、查询说有人"这类矛盾场景下会返回 None，
         这种情况下宁可不动它。
+
+        配成常驻（`always_on`）的子服直接拒，跟有没有人玩无关。
         """
+        if managed.entry.always_on:
+            return False, self.tr('action.always_on', server=managed.name)
         players, note = self._effective_players(managed)
         if players == 0:
             return True, ''

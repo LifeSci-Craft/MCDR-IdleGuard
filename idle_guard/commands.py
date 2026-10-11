@@ -301,6 +301,9 @@ def _idle_hover_lines(view: ServerView, tr) -> List[str]:
     用户要求：状态表上不再单独占一列（那列长期只有个 `-`，白占宽度），
     改成鼠标移到状态上看。
     """
+    if view.always_on:
+        # 常驻的子服：空闲多久都不会关，说清这一点比报数字有用
+        return tr('hover.idle.always_on').split('\n')
     if view.idle_timeout <= 0:
         return []
     if view.idle_seconds < 0:
@@ -344,6 +347,10 @@ def _note_cell(view: ServerView, tr, prefix: str) -> Cell:
 
 def _switch_cell(view: ServerView, index: int, tr, prefix: str, chat: bool) -> Cell:
     """最后一列：一键开关。休眠中的给绿色 [开启]，运行中的给红色 [休眠]。"""
+    if view.always_on:
+        # 常驻子服不给休眠按钮：点了也只会被拒，不如直接说明它不会休眠
+        return Cell(tr('command.status.always_on'), RColor.gray,
+                    _h(tr, 'hover.switch.always_on', server=view.name))
     action_info = _SWITCH_ACTIONS.get(view.state)
     if action_info is None:
         if view.state in (State.STARTING.value, State.STOPPING.value):
@@ -434,6 +441,9 @@ def _precheck_message(action: str, state: str, view: ServerView, tr, name: str):
     """当前状态已经让这个动作没有意义时，给出要说的话；否则返回 None。"""
     busy = tr('command.action.busy', server=name, state=tr(f'state.{state}'))
     if action == 'sleep':
+        if view.always_on:
+            # 常驻子服：提前拦掉，省得管理员输了 !!ig confirm 才发现关不了
+            return tr('action.always_on', server=name), RColor.gray
         if state in (State.SLEEPING.value, State.OFFLINE.value, State.STOPPED.value):
             return tr('action.sleep_not_needed', server=name, state=tr(f'state.{state}')), RColor.gray
         if state in (State.STARTING.value, State.STOPPING.value):
