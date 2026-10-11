@@ -140,8 +140,13 @@
   会拼进 `tellraw` / `playsound` 命令。
 - **音效要带 `execute at`**：写成 `execute at <player> run playsound <sound> master <player> ~ ~ ~ 1 1`，
   漏掉 `execute at` 时声源落在世界原点，玩家离得远就听不见。
-- **启动耗时落盘复用**：本次实测 → 上次存盘 `config/idle_guard/startup_seconds.json` →
-  `fallback_startup_seconds`，插件重载或 MCDR 重启都不会退回兜底值。
+- **启动耗时落盘复用**：本次实测 → 每台服最近 8 次样本（`config/idle_guard/startup_seconds.json`）
+  的中位数 → `fallback_startup_seconds`。用中位数而不是"上一次"，是因为启动耗时抖动很大
+  （世界加载、mod 初始化、磁盘缓存冷热），照搬上一次经常差出好几倍。旧格式（单个数字）照样能读。
+- **唤醒完成的提示要能"存起来"**：玩家是被假服务端挡回客户端的，唤醒完成时他不在任何服务端里，
+  `announce.opened` 的广播与给他的 `tell` 都送不到。所以触发过唤醒的玩家会进
+  `ManagedServer.pending_greetings`，等他 `on_player_joined` 时补一条「已开启」+ 音效
+  （超过 `player_attempt_window` 才进来就不补了）。
 - **停止要分「正常」与「异常」两路**：`on_server_stop` 按退出码分流：0（后台 `stop`、服务端自己
   优雅退出）记 `stopped`，不接管端口、不动 `EXIT_AFTER_STOP` 标记（管理员就是想用 `stop` 把实例关掉）；
   非 0（崩溃 / 被强杀）才调 `set_exit_after_stop_flag(False)` 留住 MCDR，并让假服务端接管端口、

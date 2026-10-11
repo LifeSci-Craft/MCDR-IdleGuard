@@ -11,6 +11,7 @@
   "announce.failed": "§b[Idle Guard] §fServer §b{server} §ffailed to start: §7{detail}",
   "announce.locked": "§b[Idle Guard] §fServer §b{server} §ffailed §c{count} §ftimes, auto wake-up is locked, please check the logs",
   "announce.tell_player": "§b[Idle Guard] §fServer §b{server} §fis up, type §f/server {server} §fto enter",
+  "announce.joined_after_wake": "§b[Idle Guard] §fServer §b{server} §fis up §7(took {seconds}s), welcome",
   "announce.stopped": "§b[Idle Guard] §fServer §b{server} §fhas stopped §7(wakes up on connect)",
   "announce.stopped_manual": "§b[Idle Guard] §fServer §b{server} §fhas been shut down §7(stopped manually, not sleeping — a connection will not start it)",
   "state.unknown": "unknown",
