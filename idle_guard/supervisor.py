@@ -1742,10 +1742,22 @@ class Supervisor:
             # 有实例应答了，但都说自己不负责（比如它那条的 role 是 watch）
             return False, str(replies[0].get('reason') or self.tr('action.failed'))
 
-        # 一个应答都没有：这条没配总线地址，或者负责它的实例不在线
+        # 一个应答都没有：负责它的实例不在线，或者这条没配总线地址
+        addresses = self._peer_addresses()
         entry = next((e for e in self._config.servers if e.name == server), None)
         role = entry.role if entry is not None else 'watch'
-        hint = self.tr('action.no_owner_hint', server=server, role=role)
+        # 提示要说对病因：role 已经是 auto 时，再劝人"把 role 改成 auto"是废话
+        # （线上真踩到过：管理员照做了，结果提示一字未变）
+        hint = self.tr('action.hint_auto' if role == 'auto' else 'action.hint_own',
+                       server=server, role=role)
+        # 连失败原因一起记：只说"没人应答"没法排查，得看清是连不上、鉴权失败还是对端没回
+        last_error = getattr(self._bus, 'last_error', None)
+        tried = []
+        for address in addresses:
+            reason = last_error(address) if callable(last_error) else ''
+            tried.append(f'{address}（{reason}）' if reason else address)
+        self._logger.warning(self.tr('action.no_owner_none_answered', server=server, action=action,
+                                      addresses='、'.join(tried) if tried else '无'))
         if entry is not None and not entry.bus:
             return False, self.tr('action.no_remote_bus', server=server, hint=hint)
         return False, self.tr('action.no_owner', server=server, hint=hint)
