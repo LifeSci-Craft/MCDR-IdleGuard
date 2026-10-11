@@ -285,10 +285,14 @@ def port_open(host: str, port: int, timeout: float = 1.0) -> bool:
 def bind_error(host: str, port: int) -> Optional[OSError]:
     """试着在本机绑定该端口：能绑返回 None，不能绑则返回那个 OSError（带 errno 便于排查）。
 
-    POSIX 上要开 SO_REUSEADDR：不然端口上残留的 TIME_WAIT（每次客户端正常断开都会
-    留下一条）会让 bind 失败，把"端口其实没人用"误报成"占着"。开了之后仍然绑不上
-    **正在监听**的端口，所以结论依旧可靠。Windows 上不能开 —— 那边的 SO_REUSEADDR
-    允许抢占仍在监听的端口，会让这个探测恒为"能绑"（与 fakeserver / bus 保持一致）。
+    ⚠️ 这个结果**不能**拿来判断「端口空出来了吗」：端口上只要残留一条 TIME_WAIT
+    （每次客户端正常断开都会留下一条），bind 就会报 EADDRINUSE —— 实测在 POSIX 上
+    连 SO_REUSEADDR 都救不了（那个标志解决的是"与另一个 socket 共用地址"的协商，
+    并不解除 TIME_WAIT 的占用）。所以它只当排查时的诊断信息用，正式判据是
+    `port_open`（「还有没有人在监听」，TIME_WAIT 骗不到它）。
+
+    POSIX 上仍然设 SO_REUSEADDR，与 `fakeserver` / `bus` 保持一致；Windows 上不设 ——
+    那边的语义是"允许抢一个正在监听的端口"，会让探测恒为"能绑"。
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
