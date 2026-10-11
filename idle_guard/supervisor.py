@@ -36,7 +36,7 @@ from . import velocity as velocity_module
 from .bus import Bus
 from .config import Config, ServerEntry
 from .fakeserver import FakeServer
-from .mcproto import PingResult, can_bind, port_open, status_ping
+from .mcproto import PingResult, bind_error, port_open, status_ping
 from .remote import RemoteMixin
 from .takeover import TakeoverMixin
 from .models import (
@@ -1149,12 +1149,25 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                         managed.pending_greetings[player] = now + window
 
     def _wait_port_free(self, managed: ManagedServer, timeout: float) -> bool:
-        bind_host = self._config.fake_server.bind
+        """等端口上的监听者退干净，好让真实服务端能绑上。
+
+        判据是「还有没有人在监听」，而不是「本机能不能 bind 上」：假服务端刚撤下时，
+        端口上常挂着几次状态查询留下的 TIME_WAIT —— POSIX 上不带 SO_REUSEADDR 的 bind
+        会因此失败，但它并不妨碍真实服务端起来。拿 bind 当判据会白等到超时（CI 上
+        一整批唤醒相关的测试就是这么挂的）。真有人在监听（服务端还没退干净）时才会
+        继续等，而那正是要拦住的情况。
+        """
+        host = managed.entry.host
+        port = managed.entry.port
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and not self._stopping.is_set():
-            if can_bind(bind_host, managed.entry.port):
+            if not port_open(host, port, 0.5):
                 return True
             time.sleep(0.5)
+        self._logger.warning(
+            f'{managed.name}: 端口 {host}:{port} 上一直有监听者，放弃本轮唤醒'
+            f'（本机 bind 探测结果：{bind_error(self._config.fake_server.bind, port)}）'
+        )
         return False
 
     def _wait_ready(self, managed: ManagedServer, timeout: float) -> bool:
