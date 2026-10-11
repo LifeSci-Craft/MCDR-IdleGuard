@@ -11,6 +11,7 @@
   "announce.failed": "§b[Idle Guard] §f服务器 §b{server} §f启动失败或超时：§7{detail}",
   "announce.locked": "§b[Idle Guard] §f服务器 §b{server} §f连续启动失败 §c{count} §f次，已锁定自动唤醒，请管理员检查",
   "announce.tell_player": "§b[Idle Guard] §f服务器 §b{server} §f已经开启，输入 §f/server {server} §f即可进入",
+  "announce.joined_after_wake": "§b[Idle Guard] §f服务器 §b{server} §f已开启 §7(耗时 {seconds} 秒)，欢迎回来",
   "announce.stopped": "§b[Idle Guard] §f服务器 §b{server} §f已停止 §7(有人连接时自动唤醒)",
   "announce.stopped_manual": "§b[Idle Guard] §f服务器 §b{server} §f已停止 §7(被手动关闭，不是休眠，玩家连接不会自动开服)",
   "state.unknown": "未知",

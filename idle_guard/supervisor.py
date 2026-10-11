@@ -55,8 +55,20 @@ MANAGED_ROLES = ('self', 'command')
 STALE_PLAYER_SECONDS = 60.0
 
 #: 实测启动耗时的落盘文件名（放在 MCDR 给本插件的 data 目录，即 config/idle_guard/）
-#: 有了它，插件重载/重启之后给玩家报的"预计 xx 秒"仍然是上一台服务端的真实耗时
+#: 有了它，插件重载/重启之后给玩家报的"预计 xx 秒"仍然基于这台服的真实历史
 _STARTUP_STATS_FILE = 'startup_seconds.json'
+
+#: 每个子服最多留多少个启动耗时样本（ETA 取这些样本的中位数）
+_STARTUP_SAMPLES_MAX = 8
+
+
+def _median(values: List[float]) -> float:
+    """中位数（不动入参）。"""
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 #: 合法的 Minecraft 玩家名。名字来自客户端握手（是可以随便造的），
 #: 而这个名字会被拼进 tellraw / playsound 这类命令里执行 —— 必须过滤，
@@ -104,6 +116,11 @@ class ManagedServer:
         #: 服务端重新起来、或插件明确要休眠/唤醒时清掉。
         self.external_stop = False
         self.attempts: Dict[str, float] = {}
+        #: 唤醒完成时那位玩家还不在线（他多半已经被假服务端挡回客户端了），
+        #: 于是记下"等他进服要补一句『服开好了』"：player -> 到期时刻（monotonic）。
+        #: 之所以要这样：唤醒是在**服务端内部**广播的，而他此刻不在这个服务端里，
+        #: 单独 tell 也发不出去（玩家不在线）—— 结果就是他什么提示都收不到。
+        self.pending_greetings: Dict[str, float] = {}
 
         self.action_lock = threading.RLock()
         self.startup_event = threading.Event()
@@ -211,9 +228,9 @@ class Supervisor:
         #: 发起人 -> 待二次确认的动作（每个管理员各存一份，避免互相顶掉）
         self._pending: Dict[str, PendingAction] = {}
         self._pending_lock = threading.Lock()
-        #: 各子服的实测启动耗时（秒）；内存 + 落盘，ETA 就报这个
+        #: 各子服最近的实测启动耗时（秒）列表；内存 + 落盘，ETA 取它的中位数
         self._data_dir = self._resolve_data_dir()
-        self._startup_seconds: Dict[str, float] = self._load_startup_seconds()
+        self._startup_seconds: Dict[str, List[float]] = self._load_startup_seconds()
 
         self._ignore_patterns: List[re.Pattern] = []
         for pattern in config.ignore_players:
@@ -1181,7 +1198,7 @@ class Supervisor:
             managed.empty_since = None
             managed.warned = False
             self._set_state(managed, State.RUNNING, '')
-            self._logger.info(f'{name} 已就绪，启动耗时 {elapsed:.1f} 秒（下次报 ETA 就用这个值）')
+            self._logger.info(f'{name} 已就绪，本次启动耗时 {elapsed:.1f} 秒')
             self._announce(self.tr(
                 'announce.opened', server=name, seconds=int(elapsed), player=trigger_player or '',
             ))
@@ -1190,11 +1207,18 @@ class Supervisor:
             # 只看聊天栏容易漏掉这条"服开好了"）
             if self._config.announce.tell_attempt_players:
                 sound = self._config.announce.sound
-                for player in managed.attempt_players(time.monotonic(), self._config.player_attempt_window):
-                    self.tell_player(player, self.tr(
-                        'announce.tell_player', server=name, seconds=int(elapsed),
-                    ))
-                    self.play_sound(player, sound)
+                now = time.monotonic()
+                window = self._config.player_attempt_window
+                for player in managed.attempt_players(now, window):
+                    if self._has_player(player):
+                        self.tell_player(player, self.tr(
+                            'announce.tell_player', server=name, seconds=int(elapsed),
+                        ))
+                        self.play_sound(player, sound)
+                    else:
+                        # 他还不在任何服务端里（被挡回客户端了）：此刻 tell 发不出去，
+                        # 先记下来，等他真正进服时再补（见 on_player_joined）
+                        managed.pending_greetings[player] = now + window
 
     def _wait_port_free(self, managed: ManagedServer, timeout: float) -> bool:
         bind_host = self._config.fake_server.bind
@@ -1252,7 +1276,7 @@ class Supervisor:
             self._logger.debug(f'拿不到插件数据目录，启动耗时不落盘：{type(exc).__name__}: {exc}')
             return None
 
-    def _load_startup_seconds(self) -> Dict[str, float]:
+    def _load_startup_seconds(self) -> Dict[str, List[float]]:
         if self._data_dir is None:
             return {}
         path = os.path.join(self._data_dir, _STARTUP_STATS_FILE)
@@ -1264,20 +1288,36 @@ class Supervisor:
         except Exception as exc:  # noqa: BLE001
             self._logger.warning(f'启动耗时记录读取失败（忽略）：{type(exc).__name__}: {exc}')
             return {}
-        result: Dict[str, float] = {}
+        result: Dict[str, List[float]] = {}
         if isinstance(data, dict):
             for name, value in data.items():
-                if isinstance(name, str) and isinstance(value, (int, float)) and value > 0:
-                    result[name] = float(value)
+                if not isinstance(name, str):
+                    continue
+                # 新格式：{"survival": [11.7, 12.4, 18.1]}；
+                # 旧格式：{"survival": 11.7}（单个数字）——当成只有一个样本，
+                # 老用户的文件不用手动改，跑几次之后样本自然攒起来
+                raw = value if isinstance(value, list) else [value]
+                samples = [float(item) for item in raw
+                           if isinstance(item, (int, float)) and not isinstance(item, bool)
+                           and item > 0]
+                if samples:
+                    result[name] = samples[-_STARTUP_SAMPLES_MAX:]
         return result
 
     def _remember_startup_seconds(self, name: str, seconds: float) -> None:
-        """记下这次实测的启动耗时（内存 + 落盘），下次报 ETA 就用它。"""
+        """记下这次实测的启动耗时（内存 + 落盘），ETA 用这些样本的中位数。"""
         seconds = max(0.5, round(float(seconds), 1))
-        self._startup_seconds[name] = seconds
+        samples = self._startup_seconds.setdefault(name, [])
+        samples.append(seconds)
+        del samples[:-_STARTUP_SAMPLES_MAX]
         managed = self._managed.get(name)
         if managed is not None:
             managed.last_startup_seconds = seconds
+        self._logger.info(
+            f'{name}: 启动耗时 {seconds:.1f} 秒（最近 {len(samples)} 次 '
+            f'{" / ".join(f"{value:.1f}" for value in samples)}），'
+            f'下次报 ETA 用中位数 {_median(samples):.1f} 秒'
+        )
         if self._data_dir is None:
             return
         path = os.path.join(self._data_dir, _STARTUP_STATS_FILE)
@@ -1288,13 +1328,17 @@ class Supervisor:
             self._logger.debug(f'启动耗时记录写入失败：{type(exc).__name__}: {exc}')
 
     def _eta(self, managed: Optional[ManagedServer]) -> float:
-        """预计启动耗时：优先本次实测值，其次历史上实测过的值，最后才是配置里的兜底值。"""
+        """预计启动耗时：取最近若干次实测的**中位数**。
+
+        为什么不是"上一次"：服务端的启动耗时抖动很大（世界加载、mod 初始化、磁盘缓存冷热），
+        照搬上一次经常差出好几倍，玩家看到的就是"说 12 秒，结果快 1 分钟"。
+        中位数对个别离谱样本不敏感，报出来更接近"通常要等多久"。
+        一个样本都没有时才退到配置里的兜底值。
+        """
         if managed is not None:
-            if managed.last_startup_seconds:
-                return managed.last_startup_seconds
-            remembered = self._startup_seconds.get(managed.name)
-            if remembered:
-                return remembered
+            samples = self._startup_seconds.get(managed.name)
+            if samples:
+                return _median(samples)
         return self._config.fallback_startup_seconds
 
     def eta_of(self, server: str) -> float:
@@ -1624,10 +1668,32 @@ class Supervisor:
             self._logger.debug(f'清除 EXIT_AFTER_STOP 标记失败：{type(exc).__name__}: {exc}')
 
     def on_player_joined(self, player: str) -> None:
+        now = time.monotonic()
         for managed in self._managed.values():
             if managed.role == 'self':
                 managed.players.add(player)
-                managed.players_seen_at = time.monotonic()
+                managed.players_seen_at = now
+                self._greet_after_wake(managed, player, now)
+
+    def _greet_after_wake(self, managed: ManagedServer, player: str, now: float) -> None:
+        """他进服了 —— 如果这台服是他刚才触发唤醒的那台，就补一句"已经开好了"。
+
+        为什么需要补：唤醒完成的提示是在服务端内部广播 + 单独 tell 的，而那时他刚被
+        假服务端挡回客户端，既不在这个服务端里、也不在任何服务端里，两条消息他都收不到
+        （线上反馈："启动好后并没有给我任何提示"）。
+        """
+        expiry = managed.pending_greetings.pop(player, None)
+        if expiry is None:
+            return
+        for stale in [name for name, ts in managed.pending_greetings.items() if now > ts]:
+            managed.pending_greetings.pop(stale, None)
+        if now > expiry:
+            return      # 太久之后才进来，就不补了（免得莫名其妙弹一句）
+        self.tell_player(player, self.tr(
+            'announce.joined_after_wake', server=managed.name,
+            seconds=int(managed.last_startup_seconds or 0),
+        ))
+        self.play_sound(player, self._config.announce.sound)
 
     def on_player_left(self, player: str) -> None:
         for managed in self._managed.values():

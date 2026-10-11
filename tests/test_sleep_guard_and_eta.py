@@ -176,7 +176,7 @@ def test_admin_only_is_enforced_by_mcdr_itself(env):
 
 
 # --------------------------------------------------------------------------- #
-# ③ 预计开服时间 = 上一次实测的启动耗时
+# ③ 预计开服时间 = 最近若干次实测启动耗时的中位数
 # --------------------------------------------------------------------------- #
 
 def test_eta_is_the_last_measured_startup_time(tmp_path):
@@ -190,28 +190,57 @@ def test_eta_is_the_last_measured_startup_time(tmp_path):
         instance.shutdown()
 
 
+def test_eta_is_the_median_of_recent_samples(tmp_path):
+    """线上反馈"预估不准"：只照搬上一次会被个别离谱样本带跑。
+
+    中位数对离群值不敏感 —— 这里插一个 90 秒的异常样本，ETA 不该被它拖走。
+    """
+    instance, _stub, _config = _make_supervisor(data_folder=str(tmp_path))
+    try:
+        for seconds in (11.0, 12.0, 90.0, 13.0):
+            instance._remember_startup_seconds('survival', seconds)
+        assert instance.eta_of('survival') == 12.5, instance.eta_of('survival')
+    finally:
+        instance.shutdown()
+
+
 def test_eta_survives_a_plugin_reload(tmp_path):
-    """插件重载会重建 Supervisor —— 上次的实测值必须从盘上读回来。"""
+    """插件重载会重建 Supervisor —— 之前的样本必须从盘上读回来。"""
     first, _stub, _config = _make_supervisor(data_folder=str(tmp_path))
     try:
         first._remember_startup_seconds('survival', 11.0)
+        first._remember_startup_seconds('survival', 15.0)
     finally:
         first.shutdown()
 
     second, _stub2, config = _make_supervisor(data_folder=str(tmp_path))
     try:
-        assert second.eta_of('survival') == 11.0, '重载后 ETA 退回了兜底值'
+        assert second.eta_of('survival') == 13.0, '重载后没有读回历史样本'
         assert second.eta_of('survival') != config.fallback_startup_seconds
     finally:
         second.shutdown()
 
 
-def test_this_session_measurement_wins_over_the_saved_one(tmp_path):
+def test_old_single_number_stats_file_is_still_readable(tmp_path):
+    """老版本存的是一个数字，新版本要能直接读（当成一个样本），不用用户手动改文件。"""
+    (tmp_path / 'startup_seconds.json').write_text('{"survival": 11.7}', encoding='utf-8')
     instance, _stub, _config = _make_supervisor(data_folder=str(tmp_path))
     try:
-        instance._remember_startup_seconds('survival', 30.0)
-        instance.state_of('survival').last_startup_seconds = 8.0
-        assert instance.eta_of('survival') == 8.0
+        assert instance.eta_of('survival') == 11.7
+        instance._remember_startup_seconds('survival', 12.3)
+        assert instance.eta_of('survival') == 12.0, '旧值应当被当成一个样本参与中位数'
+    finally:
+        instance.shutdown()
+
+
+def test_samples_are_capped(tmp_path):
+    """样本只留最近若干个：不能让文件无限长大。"""
+    instance, _stub, _config = _make_supervisor(data_folder=str(tmp_path))
+    try:
+        for index in range(20):
+            instance._remember_startup_seconds('survival', 10.0 + index)
+        assert len(instance._startup_seconds['survival']) == 8
+        assert instance.eta_of('survival') == 25.5          # 最近 8 个的中位数
     finally:
         instance.shutdown()
 
