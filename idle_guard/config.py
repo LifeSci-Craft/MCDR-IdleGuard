@@ -33,6 +33,10 @@ class ServerEntry(Serializable):
     auto_sleep: bool = True
     #: 有人尝试连接时是否允许自动唤醒
     auto_wake: bool = True
+    #: 常驻：**永不休眠**。适合"希望长期开着"的子服 —— 自动判定不会关它，
+    #: 管理员手敲 `!!ig sleep`（含从别的实例发来的）也会被拒绝。
+    #: 要临时关掉它，把这里改成 false 再 `!!ig reload`。
+    always_on: bool = False
     #: 该子服所属 MCDR 实例的总线地址，如 "127.0.0.1:25600"；填了才能跨服通知/远程控制
     bus: Optional[str] = None
     #: role=command 时使用；启动命令（走 shell，支持 Windows 的 start.bat）
@@ -126,6 +130,11 @@ class Config(Serializable):
     max_wake_failures: int = 3
     #: `!!ig sleep` 发出后，等多久之内可以用 `!!ig confirm` 确认（秒）
     confirm_timeout: float = 30.0
+    #: Velocity 配置文件（`velocity.toml`）的路径。
+    #: `auto` = 自动在 MCDR 工作目录附近查找；`off` / `''` = 关闭这个同步。
+    #: 打开时，插件启动会把 velocity.toml 的 `[servers]` 段里**还没写进 servers[]** 的子服
+    #: 自动补进来（名字、地址、端口），已有条目的设置一律不动。
+    velocity_config: str = 'auto'
     #: 打印详细调试日志
     debug: bool = False
 

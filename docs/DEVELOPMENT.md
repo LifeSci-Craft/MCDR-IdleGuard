@@ -34,6 +34,7 @@
 | `fakeserver.py` | 休眠期间顶替游戏端口的假服务端：应答状态查询、接住登录并触发唤醒 |
 | `bus.py` | 实例间 TCP 总线（带 token 鉴权） |
 | `config.py` | 配置数据类与默认值 |
+| `velocity.py` | 读 `velocity.toml` 的 `[servers]` 段（找文件 + 解析，不依赖 tomllib） |
 | `i18n.py` + `lang/*.json` | 多语言文案与覆盖机制 |
 
 ## 设计要点与理由
@@ -140,6 +141,14 @@
   会拼进 `tellraw` / `playsound` 命令。
 - **音效要带 `execute at`**：写成 `execute at <player> run playsound <sound> master <player> ~ ~ ~ 1 1`，
   漏掉 `execute at` 时声源落在世界原点，玩家离得远就听不见。
+- **常驻子服的判定点有两处**：`_check_idle` 的 `sleep_allowed`（不自动关）与 `_can_sleep`
+  （手动 / 远程 / 空闲三条路都经过它）。命令层 `_precheck_message` 也提前拦一次，
+  好让管理员在输入 `!!ig confirm` 之前就知道关不了。`always_on` 会随 `ServerView` 一起过总线，
+  别的实例的状态表也能显示「常驻」。
+- **子服清单同步只在启动时做一次**：`Supervisor.__init__` 里 `_sync_servers_from_velocity()`
+  先跑，再 `_compile_config()`（因为 `role: auto` 的判定要靠这些条目）。原则是**只补不改**：
+  缺的补上、已有条目一个字段都不动、地址对不上只 warning；补过之后才写回 `config.json`，
+  平时不动用户的配置文件。
 - **启动耗时落盘复用**：本次实测 → 每台服最近 8 次样本（`config/idle_guard/startup_seconds.json`）
   的中位数 → `fallback_startup_seconds`。用中位数而不是"上一次"，是因为启动耗时抖动很大
   （世界加载、mod 初始化、磁盘缓存冷热），照搬上一次经常差出好几倍。旧格式（单个数字）照样能读。
