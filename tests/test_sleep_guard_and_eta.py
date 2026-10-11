@@ -130,8 +130,8 @@ def test_every_command_requires_admin(env):
                 assert requirement.requirement(player) is False, f'{node} 普通玩家能执行'
                 assert requirement.requirement(helper) is False, f'{node} helper 能执行'
                 assert requirement.requirement(admin) is True, f'{node} 管理员被挡住了'
-        assert names == {'!!ig', 'help', 'status', 'wake', 'sleep', 'lock', 'unlock',
-                         'confirm', 'cancel', 'poll', 'reload'}, names
+        assert names == {'!!ig', 'help', 'status', 'diag', 'stats', 'wake', 'sleep', 'lock',
+                         'unlock', 'confirm', 'cancel', 'poll', 'reload'}, names
     finally:
         instance.shutdown()
 

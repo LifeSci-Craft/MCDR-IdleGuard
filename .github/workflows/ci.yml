@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: 测试与打包（Python ${{ matrix.python-version }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.12', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 安装依赖（pytest + MCDR）
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest 'mcdreforged>=2.13,<3'
+
+      - name: 单元 / 集成测试
+        run: python -m pytest tests/ -q
+
+      - name: 打包插件
+        run: python tools/build.py
+
+      - name: 产物自检（可复现 / 白名单 / 注释剥离 / 仍可编译）
+        run: python tools/check_artifact.py
+
+      - name: 上传构建产物
+        if: matrix.python-version == '3.13'
+        uses: actions/upload-artifact@v4
+        with:
+          name: idle_guard-mcdr
+          path: idle_guard-*.mcdr
+          if-no-files-found: error

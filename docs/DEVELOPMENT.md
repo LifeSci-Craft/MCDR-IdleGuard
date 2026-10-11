@@ -164,6 +164,34 @@
 - **空闲计时与 `auto_sleep` 解耦**：`_check_idle` 照常维护 `empty_since`（浮窗要显示），
   只有 `role in MANAGED_ROLES and auto_sleep and not locked` 时才真的关服。
 
+## 一台 MCDR 管多台子服
+
+每个子服各跑一个 MCDR 是最省心的拓扑（跨服通知天然准确、每台状态都由它自己算），但 MCDR 也是常驻进程
+（每个大约 100~150 MB）。子服不多、或者不想开那么多进程时，可以让**一台 MCDR 管多台子服**：把那些条目
+写成 `role: command`，由这一个实例用命令启停它们。
+
+```jsonc
+"servers": [
+  { "name": "Survival", "host": "127.0.0.1", "port": 30000, "role": "command",
+    "start_command": "start-survival.bat", "stop_command": "stop-survival.bat",
+    "working_directory": "D:/servers/survival" },
+  { "name": "Creative", "host": "127.0.0.1", "port": 30001, "role": "command",
+    "start_command": "start-creative.bat", "stop_command": "stop-creative.bat",
+    "working_directory": "D:/servers/creative" }
+]
+```
+
+几个要点：
+
+- `stop_command` 要能**优雅**停服（例如向那个服务端的控制台发 `stop`，或调它自己的停止脚本）。
+  别用 `taskkill /F` 之类的强杀：世界来不及保存，插件这边也会把它当成"异常停止"。
+- 这类子服**没有 MCDR 事件兜底**，人数完全来自状态查询。所以务必让它们开着 `enable-status=true`，
+  否则插件"数不清人"时会保守地拒绝自动休眠（这是有意的安全行为，不是 bug）。
+- 总线：一台 MCDR 只有一个 `bus.bind`，所以它管的几条 `role: command` 条目共用同一个实例地址；
+  别的实例要操作这些子服，把它们的 `servers[].bus` 都指向这一个地址。
+- 代价要说清楚：这台 MCDR 一挂，它管的**全部**子服同时失去自动启停能力；跨服通知也只能进到
+  它管的那些服务端里。子服多于两三台时，还是一台一个实例更稳。
+
 ## 打包与测试
 
 ```bash

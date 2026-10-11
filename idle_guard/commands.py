@@ -39,6 +39,8 @@ from mcdreforged.api.all import (
     Text,
 )
 
+from . import diag
+from . import stats as stats_mod
 from . import ui
 from .supervisor import MANAGED_ROLES, ServerView, State, Supervisor
 
@@ -72,6 +74,8 @@ _ROLE_COLOURS = {
 #: (帮助行的键, 能不能裸跑)
 _HELP_ROWS = (
     ('status', True),
+    ('diag', True),
+    ('stats', True),
     ('wake', False),
     ('sleep', False),
     ('confirm', True),
@@ -338,6 +342,11 @@ def _note_cell(view: ServerView, tr, prefix: str) -> Cell:
     """备注：谁在管这台子服（`@实例名`）。细节（异常原因等）都收进浮窗。"""
     if view.instance:
         hover = _h(tr, 'hover.note', instance=view.instance, server=view.name)
+        if not view.owner_online:
+            # 管它的实例联系不上：这是"对方掉线"，不是"没人管它" —— 必须标出来，
+            # 否则管理员看不出该去启动哪台 MCDR（旧版这两种情况长得一模一样）
+            return Cell(f'@{view.instance}{tr("command.status.offline")}', RColor.red,
+                        _h(tr, 'hover.note.offline', instance=view.instance, server=view.name))
         if view.locked:
             return Cell(f'{tr("command.status.locked")}@{view.instance}', RColor.red,
                         _h(tr, 'hover.locked', prefix=prefix) + '\n' + hover)
@@ -403,6 +412,62 @@ def _status_header(tr, prefix: str) -> List[Cell]:
         Cell(tr('command.status.col_note'), RColor.gray, _h(tr, 'hover.col_note')),
         Cell(tr('command.status.col_switch'), RColor.gray, _h(tr, 'hover.col_switch')),
     ]
+
+
+def _cmd_diag(source: CommandSource, supervisor: Supervisor) -> None:
+    """把运行信息汇总成"一眼能看懂"的几段：谁负责谁、总线通不通、为什么还不休眠。"""
+    tr = supervisor.tr
+    body = [RText(text, colour) for text, colour in diag.rows(supervisor)]
+    if not body:
+        _notice(source, tr('command.diag.empty'), RColor.gray)
+        return
+    _screen(source, supervisor, body, tr('command.screen.diag_hint'))
+
+
+def _stats_header(tr) -> List[Cell]:
+    return [Cell(tr('stats.col.server'), RColor.white),
+            Cell(tr('stats.col.sleep'), RColor.white),
+            Cell(tr('stats.col.seconds'), RColor.white),
+            Cell(tr('stats.col.wake'), RColor.white)]
+
+
+def _cmd_stats(source: CommandSource, supervisor: Supervisor) -> None:
+    """休眠 / 唤醒的累计统计：让管理员能量化它到底干了多少活。"""
+    tr = supervisor.tr
+    chat = _is_chat(source)
+    since, data = supervisor.stats_snapshot()
+    names = [name for name in supervisor.server_names() if name in data] or list(data)
+    if not names:
+        _notice(source, tr('command.stats.empty'), RColor.gray)
+        return
+
+    rows = [_stats_header(tr)]
+    total_sleep = total_wake = total_seconds = 0.0
+    for name in names:
+        values = data[name]
+        slept = float(values.get('sleep_seconds') or 0.0)
+        sleeps = int(values.get('sleep') or 0)
+        wakes = int(values.get('wake') or 0)
+        rows.append([
+            Cell(name, RColor.aqua),
+            Cell(str(sleeps), RColor.white),
+            Cell(stats_mod.format_duration(slept), RColor.green),
+            Cell(str(wakes), RColor.white),
+        ])
+        total_sleep += sleeps
+        total_wake += wakes
+        total_seconds += slept
+    rows.append([
+        Cell(tr('stats.row.total'), RColor.yellow),
+        Cell(str(int(total_sleep)), RColor.yellow),
+        Cell(stats_mod.format_duration(total_seconds), RColor.yellow),
+        Cell(str(int(total_wake)), RColor.yellow),
+    ])
+
+    body = [RText(tr('stats.header.since',
+                     time=time.strftime('%Y-%m-%d %H:%M', time.localtime(since))), RColor.gray)]
+    body.extend(_table(rows, chat=chat))
+    _screen(source, supervisor, body, tr('command.screen.stats_hint'))
 
 
 def _cmd_status(source: CommandSource, supervisor: Supervisor, prefix: str = '!!ig') -> None:
@@ -645,6 +710,14 @@ def build_tree(supervisor: Supervisor, prefix: str) -> Literal:
     root.then(
         Literal('status').requires(admin(PERM_STATUS))
         .runs(lambda src, ctx, _sup=supervisor, _p=prefix: _cmd_status(src, _sup, _p))
+    )
+    root.then(
+        Literal('diag').requires(admin(PERM_STATUS))
+        .runs(lambda src, ctx, _sup=supervisor: _cmd_diag(src, _sup))
+    )
+    root.then(
+        Literal('stats').requires(admin(PERM_STATUS))
+        .runs(lambda src, ctx, _sup=supervisor: _cmd_stats(src, _sup))
     )
     for action in ('wake', 'sleep', 'lock', 'unlock'):
         root.then(

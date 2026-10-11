@@ -24,9 +24,10 @@ import re
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 from mcdreforged.api.types import PluginServerInterface
 
@@ -36,24 +37,15 @@ from .bus import Bus
 from .config import Config, ServerEntry
 from .fakeserver import FakeServer
 from .mcproto import PingResult, can_bind, port_open, status_ping
+from .remote import RemoteMixin
+from .takeover import TakeoverMixin
+from .models import (
+    MANAGED_ROLES, STALE_PLAYER_SECONDS, ManagedServer, PendingAction, ServerView,
+    StartupSample, State, _parse_startup_sample, safe_player_name,
+)
+from .stats import Stats
 
 
-class State(str, Enum):
-    UNKNOWN = 'unknown'
-    OFFLINE = 'offline'      # 服务端未运行，且端口无人接管（过渡态：插件随时会挂上假服务端）
-    SLEEPING = 'sleeping'    # 已休眠：服务端停止 + 假服务端顶替端口
-    STOPPED = 'stopped'      # 被手动/外部停止：服务端未运行，且**插件不接管端口**
-    STARTING = 'starting'
-    RUNNING = 'running'
-    STOPPING = 'stopping'
-
-
-MANAGED_ROLES = ('self', 'command')
-
-#: "MCDR 漏报离开"的自愈门槛（秒）：状态查询必须**连续**这么久都报 0 人在线，
-#: 才允许拿它去清掉事件里那个名字。留这么长的窗口是为了不动摇"两个信号矛盾时先不动"
-#: 这条安全线 —— 真实服务端不可能一边有人玩、一边持续一分钟说自己是空的。
-STALE_PLAYER_SECONDS = 60.0
 
 #: 实测启动耗时的落盘文件名（放在 MCDR 给本插件的 data 目录，即 config/idle_guard/）
 #: 有了它，插件重载/重启之后给玩家报的"预计 xx 秒"仍然基于这台服的真实历史
@@ -71,148 +63,8 @@ def _median(values: List[float]) -> float:
         return ordered[mid]
     return (ordered[mid - 1] + ordered[mid]) / 2.0
 
-#: 合法的 Minecraft 玩家名。名字来自客户端握手（是可以随便造的），
-#: 而这个名字会被拼进 tellraw / playsound 这类命令里执行 —— 必须过滤，
-#: 否则一个叫 `a] ... ` 的假客户端就能往服务端注入命令。
-_PLAYER_NAME_RE = re.compile(r'^[A-Za-z0-9_]{1,16}$')
 
-
-def safe_player_name(player: Optional[str]) -> str:
-    """只放行合法玩家名；不合法一律返回空串（调用方据此跳过）。"""
-    name = str(player or '').strip()
-    return name if _PLAYER_NAME_RE.match(name) else ''
-
-
-class ManagedServer:
-    """一个由本实例负责启停的子服务器。"""
-
-    def __init__(self, entry: ServerEntry, role: str):
-        self.entry = entry
-        self.role = role
-        self.state = State.UNKNOWN
-        self.state_since = time.monotonic()
-        self.detail = ''
-
-        self.empty_since: Optional[float] = None
-        self.warned = False
-        self.locked = False
-        self.wake_failures = 0
-        self.last_wake_ts = 0.0
-        self.launch_started: Optional[float] = None
-        self.started_at: Optional[float] = None
-        self.last_startup_seconds: Optional[float] = None
-
-        self.players: set = set()
-        #: 最近一次**成功**的状态查询时刻（monotonic）：只有它比"最后确认有人"更晚，
-        #: 才允许用查询结果去纠正 MCDR 漏报的"离开"（见 _drop_stale_players）
-        self.slp_at = 0.0
-        #: 连续报"0 人在线"是从什么时候开始的（None = 最近一次查询不是 0 人 / 查不通）
-        self.slp_zero_since: Optional[float] = None
-        #: 最近一次确认"这服上确实有人在"的时刻（进服事件 / 出现在状态查询的名单里）
-        self.players_seen_at = 0.0
-        self.slp = PingResult()
-        self.fake: Optional[FakeServer] = None
-        #: 这台服是被**外部**停掉的（后台敲 `stop`、别的程序关的、崩了之后被关的），
-        #: 而不是插件自己休眠 —— 这种"已停止"插件不接管端口、也不会替玩家自动开服。
-        #: 服务端重新起来、或插件明确要休眠/唤醒时清掉。
-        self.external_stop = False
-        self.attempts: Dict[str, float] = {}
-        #: 唤醒完成时那位玩家还不在线（他多半已经被假服务端挡回客户端了），
-        #: 于是记下"等他进服要补一句『服开好了』"：player -> 到期时刻（monotonic）。
-        #: 之所以要这样：唤醒是在**服务端内部**广播的，而他此刻不在这个服务端里，
-        #: 单独 tell 也发不出去（玩家不在线）—— 结果就是他什么提示都收不到。
-        self.pending_greetings: Dict[str, float] = {}
-
-        self.action_lock = threading.RLock()
-        self.startup_event = threading.Event()
-        self.stop_event = threading.Event()
-        #: 本实例是否正在执行休眠/唤醒动作（动作期间状态由动作线程负责，轮询不去改它）
-        self.action_in_progress = False
-        #: 是否已经就"用状态查询兜底判就绪"记过一次日志
-        self.ready_fallback_logged = False
-        #: 假服务端接管端口的后台重试线程（端口迟迟不释放时不让玩家一直撞被拒）
-        self.takeover_thread: Optional[threading.Thread] = None
-
-    @property
-    def name(self) -> str:
-        return self.entry.name
-
-    @property
-    def idle_timeout(self) -> float:
-        return self.entry.idle_timeout if self.entry.idle_timeout else 0.0
-
-    def record_attempt(self, player: Optional[str], now: float, window: float) -> None:
-        key = player or '?'
-        self.attempts[key] = now
-        for stale in [k for k, ts in self.attempts.items() if now - ts > window]:
-            self.attempts.pop(stale, None)
-
-    def attempt_players(self, now: float, window: float) -> List[str]:
-        return [name for name, ts in self.attempts.items()
-                if name != '?' and now - ts <= window]
-
-
-@dataclass
-class ServerView:
-    """用于展示/总线传输的服务器状态快照。"""
-
-    name: str = ''
-    host: str = ''
-    port: int = 0
-    role: str = 'watch'
-    state: str = State.UNKNOWN.value
-    players: int = -1
-    players_max: int = -1
-    idle_seconds: float = -1.0
-    idle_timeout: float = 0.0
-    locked: bool = False
-    #: 这台子服是否参与自动休眠（浮窗里要说明"空闲但不关"的原因）
-    auto_sleep: bool = True
-    #: 常驻：永不休眠（自动与手动都拒绝）
-    always_on: bool = False
-    detail: str = ''
-    instance: str = ''
-    local: bool = False
-
-    def to_dict(self) -> dict:
-        return {
-            'name': self.name, 'host': self.host, 'port': self.port, 'role': self.role,
-            'state': self.state, 'players': self.players, 'players_max': self.players_max,
-            'idle_seconds': self.idle_seconds, 'idle_timeout': self.idle_timeout,
-            'locked': self.locked, 'auto_sleep': self.auto_sleep, 'detail': self.detail,
-            'always_on': self.always_on,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict, instance: str = '') -> 'ServerView':
-        view = cls()
-        for key in ('name', 'host', 'role', 'state', 'detail'):
-            if isinstance(data.get(key), str):
-                setattr(view, key, data[key])
-        for key in ('port', 'players', 'players_max'):
-            if isinstance(data.get(key), (int, float)):
-                setattr(view, key, int(data[key]))
-        for key in ('idle_seconds', 'idle_timeout'):
-            if isinstance(data.get(key), (int, float)):
-                setattr(view, key, float(data[key]))
-        view.locked = bool(data.get('locked', False))
-        view.auto_sleep = bool(data.get('auto_sleep', True))
-        view.always_on = bool(data.get('always_on', False))
-        view.instance = instance
-        return view
-
-
-@dataclass
-class PendingAction:
-    """等待管理员二次确认的动作（目前只有 sleep —— 关服是不可逆的，值得多问一句）。"""
-
-    action: str
-    server: str
-    by: str
-    deadline: float
-
-
-class Supervisor:
+class Supervisor(TakeoverMixin, RemoteMixin):
     def __init__(self, mcdr: PluginServerInterface, config: Config, plugin_id: str = 'idle_guard',
                  plugin_version: str = ''):
         self._mcdr = mcdr
@@ -228,14 +80,25 @@ class Supervisor:
         self._managed: Dict[str, ManagedServer] = {}
         self._views: Dict[str, ServerView] = {}      # 所有子服（含只监视的）最新快照
         self._last_ping: Dict[str, PingResult] = {}
+        #: 子服名 -> "最近一次见到是谁在管它"（从对端应答里学到的）
+        self._owner_name: Dict[str, str] = {}
+        #: 对端实例的健康度：总线地址 -> {ok, at, instance, error}
+        self._peer_health: Dict[str, dict] = {}
         self._self_name: Optional[str] = None
+        #: 为什么认定"本实例负责这台服"（给 !!ig diag 展示，省得管理员猜）
+        self._claim_reason: str = ''
+        #: 最近的状态变化（`!!ig diag` 的"最近事件"），只留最后若干条
+        self._recent: Deque[Tuple[float, str]] = deque(maxlen=12)
         self.instance_name = ''
         #: 发起人 -> 待二次确认的动作（每个管理员各存一份，避免互相顶掉）
         self._pending: Dict[str, PendingAction] = {}
         self._pending_lock = threading.Lock()
         #: 各子服最近的实测启动耗时（秒）列表；内存 + 落盘，ETA 取它的中位数
         self._data_dir = self._resolve_data_dir()
-        self._startup_seconds: Dict[str, List[float]] = self._load_startup_seconds()
+        self._startup_seconds: Dict[str, List[StartupSample]] = self._load_startup_seconds()
+        #: 休眠 / 唤醒的累计计数（落盘），`!!ig stats` 用
+        self._stats = Stats(os.path.join(self._data_dir, 'stats.json')
+                            if self._data_dir else None)
 
         self._ignore_patterns: List[re.Pattern] = []
         for pattern in config.ignore_players:
@@ -243,6 +106,13 @@ class Supervisor:
                 self._ignore_patterns.append(re.compile(pattern))
             except re.error as exc:
                 self._logger.warning(f'ignore_players 中的正则 {pattern!r} 无效：{exc}')
+
+        self._busy_patterns: List[re.Pattern] = []
+        for pattern in config.busy_patterns:
+            try:
+                self._busy_patterns.append(re.compile(pattern))
+            except re.error as exc:
+                self._logger.warning(f'busy_patterns 中的正则 {pattern!r} 无效：{exc}')
 
         # 先按 velocity.toml 补齐子服清单，再做角色判定（判 role=auto 要靠这些条目）
         self._sync_servers_from_velocity()
@@ -290,8 +160,72 @@ class Supervisor:
         value = state.value if isinstance(state, State) else str(state)
         return self.tr(f'state.{value}')
 
+    # ---------------------------------------------------------------- 只读查询
+    # 下面几个是给 `!!ig diag` / `!!ig stats` 这类"展示用途"准备的只读接口，
+    # 不参与任何状态流转。
+
+    @property
+    def bus_bind(self) -> Optional[str]:
+        """本实例监听的总线地址（没配置时为 None）。"""
+        return self._bus_bind
+
+    @property
+    def claim_reason(self) -> str:
+        """为什么认定"本实例负责某台服"（给诊断页展示）。"""
+        return self._claim_reason
+
+    def managed_names(self) -> List[str]:
+        """本实例负责的子服名（按配置顺序）。"""
+        return [entry.name for entry in self._config.servers
+                if entry.name in self._managed and self._managed[entry.name].role in MANAGED_ROLES]
+
+    def server_names(self) -> List[str]:
+        """配置里出现的所有子服名（按配置顺序）。"""
+        return [entry.name for entry in self._config.servers if entry.name]
+
+    def peer_health(self) -> Dict[str, dict]:
+        """对端实例的健康度快照：{总线地址: {ok, at, instance, error}}。"""
+        return {address: dict(health) for address, health in self._peer_health.items()}
+
+    def recent_events(self) -> List[str]:
+        """最近的状态变化（带时间戳），最新的在后。"""
+        now = time.monotonic()
+        out = []
+        for stamp, text in self._recent:
+            clock = time.strftime('%H:%M:%S', time.localtime(time.time() - (now - stamp)))
+            out.append(f'{clock}  {text}')
+        return out
+
+    def stats_snapshot(self) -> Tuple[float, Dict[str, Dict[str, float]]]:
+        """(统计起点时间戳, {子服: {sleep, wake, sleep_seconds}})。
+
+        进行中的那一段休眠会按"到现在为止"折算进去，免得正在睡的服显示 0。
+        """
+        since, data = self._stats.snapshot()
+        for name, values in data.items():
+            ongoing = self._stats.sleeping_seconds(name)
+            if ongoing:
+                values['sleep_seconds'] = values.get('sleep_seconds', 0.0) + ongoing
+        return since, data
+
+    def startup_samples(self, name: str) -> List[float]:
+        """某台服最近的实测启动耗时样本（秒，不含停机时长）。"""
+        return [seconds for seconds, _gap in (self._startup_seconds.get(name) or [])]
+
     def role_text(self, role: str) -> str:
         return self.tr(f'role.{role}')
+
+    # ---- 模块级探测函数的转发层（给拆出去的 mixin 用）----
+    # 看着绕，但很有用：探测函数留在本模块里，测试（以及别的插件）打补丁
+    # `supervisor.status_ping` / `supervisor.port_open` 仍然生效；
+    # mixin 里通过 `self._probe_status(...)` / `self._probe_port(...)` 走这里。
+    # 名字特意不叫 `_status_ping` / `_port_open`：本类里已经有一个
+    # `_port_open(managed)`（判断"这台的端口现在能连上吗"），重名会把它覆盖掉。
+    def _probe_status(self, host: str, port: int, timeout: float = 1.5) -> PingResult:
+        return status_ping(host, port, timeout)
+
+    def _probe_port(self, host: str, port: int, timeout: float = 0.6) -> bool:
+        return port_open(host, port, timeout)
 
     # ================================================================== 生命周期
 
@@ -431,6 +365,7 @@ class Supervisor:
     def _resolve_self(self, entries: List[ServerEntry]) -> Optional[str]:
         explicit = [e for e in entries if e.role == 'self']
         if len(explicit) == 1:
+            self._claim_reason = f'配置里 {explicit[0].name} 的 role 写成了 self'
             return explicit[0].name
         if len(explicit) > 1:
             self._logger.warning('配置里有多个 role=self，将按 server.properties 的端口来判定')
@@ -440,12 +375,20 @@ class Supervisor:
             matched = [e for e in entries if e.port == own_port]
             if len(matched) == 1:
                 self._logger.info(f'按 server.properties 的 server-port={own_port} 判定本实例负责 {matched[0].name}')
+                self._claim_reason = f'server.properties 的 server-port={own_port} 匹配到 {matched[0].name}'
                 return matched[0].name
             if len(matched) > 1:
                 self._logger.warning(f'有多个子服都填了端口 {own_port}，无法自动判定，请显式指定 role=self')
+                self._claim_reason = f'有多个条目都写了端口 {own_port}（无法自动判定）'
                 return explicit[0].name if explicit else None
             self._logger.warning(f'没有任何子服条目匹配 server.properties 的 server-port={own_port}，'
                                  f'请检查配置中的端口')
+            self._claim_reason = (f'server.properties 的 server-port={own_port} '
+                                  f'没有匹配到任何条目（本实例谁都不管）')
+        elif explicit:
+            self._claim_reason = '读不到 server.properties，退回用 role=self 的条目'
+        else:
+            self._claim_reason = '读不到 server.properties，也没有 role=self 的条目'
         return explicit[0].name if explicit else None
 
     def _read_own_server_port(self) -> Optional[int]:
@@ -551,6 +494,8 @@ class Supervisor:
             self._views[entry.name] = self._build_view(entry, ping)
         for managed_server in managed:
             self._ensure_fake_server(managed_server, retry=True)
+        # 顺便探一下对端实例：状态表要能区分"没人管"与"管它的实例掉线了"
+        self._poll_peers()
 
     def poll_once(self) -> None:
         """侦察一轮：更新所有子服状态、维护假服务端、判定空闲。"""
@@ -745,82 +690,12 @@ class Supervisor:
         if old != state:
             self._logger.info(f'{managed.name}: {old.value} -> {state.value}'
                               + (f'（{detail}）' if detail else ''))
+            self._recent.append(
+                (time.monotonic(),
+                 f'{managed.name}: {old.value} -> {state.value}' + (f'（{detail}）' if detail else '')))
             if state != State.RUNNING:
                 managed.empty_since = None
                 managed.warned = False
-
-    def _ensure_fake_server(self, managed: ManagedServer, force: bool = False,
-                            retry: bool = False) -> None:
-        """确保"服务端没在跑"的时候有假服务端顶替端口，以便接住玩家的连接尝试。
-
-        force=True 时允许用 SO_REUSEADDR 强行接管——Windows 上只要端口还残留着
-        TIME_WAIT/CLOSE_WAIT 连接就拒绝 bind，而服务端刚退出时几乎总是这样，
-        于是玩家能连接的时间窗会被拖到几分钟（实测线上 2 分 43 秒）。
-        调用方负责先确认"端口上没有真实服务端在应答"（见 _can_force_take_over）。
-
-        retry=True 时，绑定失败会再挂一个后台线程持续重试（见 _ensure_takeover_retry）。
-        """
-        need_fake = (
-            self._config.fake_server.enabled
-            and managed.entry.auto_wake
-            # 被外部正常停掉的服不算"该接管"：管理员自己关的就是关了，
-            # 端口挂个假服务端上去会把"已停止"又变成"已休眠"
-            and not managed.external_stop
-            # STOPPING 也算：服务端正在退出的那几秒里就该开始抢端口，
-            # 一等到端口释放立刻接管（玩家能连上的时间窗越短越好）
-            and managed.state in (State.STOPPING, State.SLEEPING, State.OFFLINE)
-        )
-        if not need_fake:
-            if managed.fake is not None and managed.fake.running:
-                managed.fake.stop()
-            return
-        if managed.fake is None:
-            managed.fake = FakeServer(
-                bind_host=self._config.fake_server.bind,
-                port=managed.entry.port,
-                status_factory=lambda protocol, name=managed.name: self._fake_status(name, protocol),
-                kick_factory=lambda name=managed.name: self._fake_kick(name),
-                on_login_attempt=lambda player, peer, name=managed.name: self._on_login_attempt(name, player, peer),
-                logger=self._logger,
-            )
-        if not managed.fake.running:
-            if not self._can_start_fake(managed):
-                # 真实服务端还活着 —— 绝不抢先绑定：假服务端绑在具体地址（如 127.0.0.1）时，
-                # 即使真实服务端占着 0.0.0.0，Windows 也会放行这次 bind，
-                # 于是它会悄悄把玩家连接抢走（比"暂时连不上"严重得多）
-                if retry:
-                    self._ensure_takeover_retry(managed)
-                return
-            if managed.fake.start(force=force):
-                if managed.state == State.OFFLINE:
-                    self._set_state(managed, State.SLEEPING, self.tr('detail.fake_took_over'))
-            else:
-                if managed.state == State.SLEEPING:
-                    self._set_state(managed, State.OFFLINE,
-                                    self.tr('detail.fake_bind_failed', error=managed.fake.last_error))
-                if retry:
-                    self._ensure_takeover_retry(managed)
-
-    def _fake_status(self, name: str, client_protocol: int = -1) -> dict:
-        """假服务端的状态响应。protocol 回显客户端协议号，避免客户端显示"版本不兼容"红叉。"""
-        return {
-            'version': {
-                'name': self.tr('fake.version_name'),
-                'protocol': client_protocol if client_protocol >= 0 else 0,
-            },
-            'players': {'max': 0, 'online': 0, 'sample': []},
-            'description': {'text': self.tr('fake.motd', server=name)},
-            # 自定义标记：便于本插件与其它工具识别"这是休眠中的占位服务端"
-            '_idle_guard': {
-                'server': name,
-                'state': 'sleeping',
-                'eta': int(self._eta(self._managed.get(name))),
-            },
-        }
-
-    def _fake_kick(self, name: str) -> str:
-        managed = self._managed.get(name)
-        return self.tr('fake.kick_message', server=name, eta=int(self._eta(managed)))
 
     # ================================================================== 空闲判定
 
@@ -886,6 +761,13 @@ class Supervisor:
         if not sleep_allowed:
             managed.warned = False
             return                      # 只计时，不管服（浮窗里仍然能看到空闲多久）
+
+        if managed.busy_until > now:
+            # 服务端正在忙（备份 / 保存）：这一轮先不动它，空闲计时照常累计 ——
+            # 等它忙完，下一轮就会照常关服
+            self._logger.debug(f'{managed.name}: 服务端正在忙，延后自动休眠'
+                               f'（还剩 {int(managed.busy_until - now)} 秒）')
+            return
 
         idle = now - managed.empty_since
         if idle < timeout:
@@ -993,6 +875,63 @@ class Supervisor:
                                   count=players, players=shown)
         return False, self.tr('action.sleep_has_players_anon', server=managed.name, count=players)
 
+    def sleep_checklist(self, name: str) -> List[Tuple[bool, str]]:
+        """列出"现在能不能休眠这台服"的逐条判定（给 `!!ig diag` 用）。
+
+        返回 [(是否通过, 说明)]，顺序就是判定的顺序：管理员一眼能看出**卡在哪一条**，
+        不用去翻日志猜（线上反馈："为什么它还不休眠"是个答不上来的问题）。
+        """
+        tr = self.tr
+        managed = self._managed.get(name)
+        if managed is None:
+            return [(False, tr('diag.check.owner.fail'))]
+        checks: List[Tuple[bool, str]] = []
+        managed_here = managed.role in MANAGED_ROLES
+        checks.append((managed_here, tr('diag.check.owner.ok' if managed_here
+                                         else 'diag.check.owner.fail')))
+        if not managed_here:
+            return checks
+        running = managed.state == State.RUNNING
+        checks.append((running, tr('diag.check.state.ok' if running else 'diag.check.state.fail',
+                                   state=self.state_text(managed.state))))
+
+        # 开关类：常驻 / 关掉了自动休眠 / 被锁定 —— 只要有一条成立就不会自动关它
+        if managed.entry.always_on:
+            switch_ok, switch_key = False, 'diag.check.switch.always_on'
+        elif not managed.entry.auto_sleep:
+            switch_ok, switch_key = False, 'diag.check.switch.auto_off'
+        elif managed.locked:
+            switch_ok, switch_key = False, 'diag.check.switch.locked'
+        else:
+            switch_ok, switch_key = True, 'diag.check.switch.ok'
+        checks.append((switch_ok, tr(switch_key)))
+
+        players, note = self._effective_players(managed)
+        if players is None:
+            checks.append((False, tr('diag.check.players.unknown', detail=note)))
+        elif players > 0:
+            checks.append((False, tr('diag.check.players.some', count=players)))
+        else:
+            checks.append((True, tr('diag.check.players.none')))
+
+        busy_left = managed.busy_until - time.monotonic()
+        checks.append((busy_left <= 0,
+                       tr('diag.check.busy' if busy_left > 0 else 'diag.check.busy.ok',
+                          seconds=int(max(0.0, busy_left)))))
+
+        if managed.state == State.RUNNING:
+            limit = int((managed.idle_timeout or self._config.idle_timeout) // 60)
+            if managed.empty_since is None:
+                checks.append((False, tr('diag.check.idle.none', limit=limit)))
+            else:
+                idle = int((time.monotonic() - managed.empty_since) // 60)
+                reached = (time.monotonic() - managed.empty_since) >= (managed.idle_timeout
+                                                                       or self._config.idle_timeout)
+                checks.append((reached, tr('diag.check.idle.reached' if reached
+                                           else 'diag.check.idle.waiting',
+                                           idle=idle, limit=limit)))
+        return checks
+
     def sleep_server(self, name: str, reason: str = 'manual', by: str = 'system') -> Tuple[bool, str]:
         """休眠一个由本实例负责的子服（阻塞直到停止完成或超时）。
 
@@ -1046,87 +985,9 @@ class Supervisor:
                 detail=reason,
             ))
             self._logger.info(f'{name} 已休眠（{reason}，{by}）')
+            self._stats.note_sleep(name)
             managed.started_at = None
             return True, self.tr('action.sleep_stopped', server=name)
-
-    def _can_start_fake(self, managed: ManagedServer) -> bool:
-        """真实服务端还活着时不让假服务端绑端口。
-
-        起因：假服务端绑的是具体地址（默认配置里是 0.0.0.0，但有人会写 127.0.0.1），
-        而 Windows 允许"具体地址"再绑一次仍被 0.0.0.0 占着的端口 ——
-        那时假服务端会把玩家连接从活着的服务端手里抢走，比"暂时连不上"严重得多。
-        """
-        if managed.role == 'self':
-            try:
-                return not self._mcdr.is_server_running()
-            except Exception as exc:  # noqa: BLE001
-                self._logger.debug(f'{managed.name}: 查询服务端运行状态失败：{type(exc).__name__}: {exc}')
-                return False
-        return not port_open(managed.entry.host, managed.entry.port, 0.5)
-
-    def _can_force_take_over(self, managed: ManagedServer) -> bool:
-        """能不能用 SO_REUSEADDR 强行接管端口？
-
-        只在"确认真实服务端已经不在跑"时才允许 —— 否则会把一个活着的服务端的端口抢走，
-        那比"暂时连不上"严重得多。两道确认：
-
-        1. 本实例负责的服务端：MCDR 报告它没在运行（进程已退出）；
-        2. 端口上没有任何**真实**服务端在应答（协议层查询能区分真假，假服务端自带标记）。
-        """
-        if managed.role == 'self':
-            try:
-                if self._mcdr.is_server_running():
-                    return False
-            except Exception as exc:  # noqa: BLE001
-                self._logger.debug(f'{managed.name}: 查询服务端运行状态失败：{type(exc).__name__}: {exc}')
-                return False
-        ping = status_ping(managed.entry.host, managed.entry.port, 1.0)
-        return not (ping.online and not ping.is_fake)
-
-    def _take_over_port(self, managed: ManagedServer, timeout: Optional[float] = None) -> bool:
-        """让假服务端接管端口，尽量别让玩家撞上"连接被拒绝"。
-
-        - 先普通 bind；失败就 0.25 秒一次地重试（服务端刚退出时端口往往还占着）；
-        - 3 秒还不行且确认端口上没有真实服务端在应答，就改用 SO_REUSEADDR 强行接管
-          （Windows 上残留的 TIME_WAIT/CLOSE_WAIT 连接会让普通 bind 一直失败）；
-        - 仍然失败就交给一个后台线程持续重试，**不再依赖侦察间隔**
-          （侦察间隔默认 10 分钟，靠它重试等于玩家对着被拒的连接干等）。
-        """
-        budget = timeout if timeout is not None else min(30.0, self._config.port_release_timeout)
-        deadline = time.monotonic() + budget
-        force_after = min(3.0, budget)
-        started = time.monotonic()
-        # 只在"服务端正在停 / 已经停"时抢端口；一旦它开始启动（STARTING/RUNNING）就立刻收手
-        while not self._stopping.is_set() and managed.state not in (State.STARTING, State.RUNNING):
-            force = (time.monotonic() - started) >= force_after and self._can_force_take_over(managed)
-            self._ensure_fake_server(managed, force=force)
-            if managed.fake is not None and managed.fake.running:
-                return True
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(0.25)
-        if managed.fake is not None and managed.fake.running:
-            return True
-        self._logger.warning(f'{managed.name}: 端口 {managed.entry.port} 暂时移交不了给假服务端'
-                             f'（{managed.fake.last_error if managed.fake else "未知原因"}），'
-                             f'改为后台持续重试；这期间玩家连接会被拒绝')
-        self._ensure_takeover_retry(managed)
-        return False
-
-    def _ensure_takeover_retry(self, managed: ManagedServer) -> None:
-        """起一个后台线程，每 0.25 秒试一次，直到假服务端接管端口（或被唤醒）。"""
-        if not self._config.fake_server.enabled or not managed.entry.auto_wake:
-            return
-        alive = managed.takeover_thread is not None and managed.takeover_thread.is_alive()
-        if alive:
-            return
-        managed.takeover_thread = threading.Thread(
-            target=self._takeover_retry_loop,
-            args=(managed,),
-            name=f'IdleGuard-Takeover-{managed.name}',
-            daemon=True,
-        )
-        managed.takeover_thread.start()
 
     def _takeover_retry_loop(self, managed: ManagedServer) -> None:
         while not self._stopping.is_set():
@@ -1256,13 +1117,16 @@ class Supervisor:
             # 4) 成功
             elapsed = time.monotonic() - (managed.launch_started or time.monotonic())
             # 记下这次的真实耗时（落盘）：下次给玩家的"预计 xx 秒"就照这次写
-            self._remember_startup_seconds(name, elapsed)
+            self._remember_startup_seconds(name, elapsed, self._down_seconds(managed))
             managed.wake_failures = 0
             managed.started_at = time.monotonic()
+            managed.last_stopped_at = 0.0
             managed.empty_since = None
             managed.warned = False
             self._set_state(managed, State.RUNNING, '')
-            self._logger.info(f'{name} 已就绪，本次启动耗时 {elapsed:.1f} 秒')
+            slept = self._stats.note_wake(name)
+            self._logger.info(f'{name} 已就绪，本次启动耗时 {elapsed:.1f} 秒'
+                              + (f'（本次休眠 {int(slept)} 秒）' if slept else ''))
             self._announce(self.tr(
                 'announce.opened', server=name, seconds=int(elapsed), player=trigger_player or '',
             ))
@@ -1340,7 +1204,7 @@ class Supervisor:
             self._logger.debug(f'拿不到插件数据目录，启动耗时不落盘：{type(exc).__name__}: {exc}')
             return None
 
-    def _load_startup_seconds(self) -> Dict[str, List[float]]:
+    def _load_startup_seconds(self) -> Dict[str, List[StartupSample]]:
         if self._data_dir is None:
             return {}
         path = os.path.join(self._data_dir, _STARTUP_STATS_FILE)
@@ -1352,35 +1216,45 @@ class Supervisor:
         except Exception as exc:  # noqa: BLE001
             self._logger.warning(f'启动耗时记录读取失败（忽略）：{type(exc).__name__}: {exc}')
             return {}
-        result: Dict[str, List[float]] = {}
+        result: Dict[str, List[StartupSample]] = {}
         if isinstance(data, dict):
             for name, value in data.items():
                 if not isinstance(name, str):
                     continue
-                # 新格式：{"survival": [11.7, 12.4, 18.1]}；
-                # 旧格式：{"survival": 11.7}（单个数字）——当成只有一个样本，
-                # 老用户的文件不用手动改，跑几次之后样本自然攒起来
+                # 新格式：{"survival": [[11.7, 45.0], [12.4, 3600.0]]}（耗时 + 停机时长）；
+                # 旧格式：{"survival": 11.7} 或 {"survival": [11.7, 12.4]} —— 照样能读，
+                # 老用户的文件不用手动改，跑几次之后样本自然攒成新格式
                 raw = value if isinstance(value, list) else [value]
-                samples = [float(item) for item in raw
-                           if isinstance(item, (int, float)) and not isinstance(item, bool)
-                           and item > 0]
+                samples = [parsed for parsed in (_parse_startup_sample(item) for item in raw)
+                           if parsed is not None]
                 if samples:
                     result[name] = samples[-_STARTUP_SAMPLES_MAX:]
         return result
 
-    def _remember_startup_seconds(self, name: str, seconds: float) -> None:
-        """记下这次实测的启动耗时（内存 + 落盘），ETA 用这些样本的中位数。"""
+    def _remember_startup_seconds(self, name: str, seconds: float,
+                                  down_seconds: Optional[float] = None) -> None:
+        """记下这次实测的启动耗时（内存 + 落盘），ETA 用这些样本的中位数。
+
+        `down_seconds` = 距上次停止过了多久，用来把样本分成冷 / 热启动两桶。
+        """
         seconds = max(0.5, round(float(seconds), 1))
+        if down_seconds is not None:
+            down_seconds = max(0.0, round(float(down_seconds), 1))
         samples = self._startup_seconds.setdefault(name, [])
-        samples.append(seconds)
+        samples.append((seconds, down_seconds))
         del samples[:-_STARTUP_SAMPLES_MAX]
         managed = self._managed.get(name)
         if managed is not None:
             managed.last_startup_seconds = seconds
+        shown = ' / '.join(f'{value[0]:.1f}' for value in samples)
+        cold_hot = ''
+        if down_seconds is not None:
+            cold_hot = ('（热启动：停机 {:.0f} 秒）' if down_seconds <= self._config.hot_startup_window
+                        else '（冷启动：停机 {:.0f} 秒）').format(down_seconds)
         self._logger.info(
-            f'{name}: 启动耗时 {seconds:.1f} 秒（最近 {len(samples)} 次 '
-            f'{" / ".join(f"{value:.1f}" for value in samples)}），'
-            f'下次报 ETA 用中位数 {_median(samples):.1f} 秒'
+            f'{name}: 启动耗时 {seconds:.1f} 秒{cold_hot}'
+            f'（最近 {len(samples)} 次 {shown}），'
+            f'下次报 ETA 用中位数 {_median([value[0] for value in samples]):.1f} 秒'
         )
         if self._data_dir is None:
             return
@@ -1399,30 +1273,32 @@ class Supervisor:
         中位数对个别离谱样本不敏感，报出来更接近"通常要等多久"。
         一个样本都没有时才退到配置里的兜底值。
         """
-        if managed is not None:
-            samples = self._startup_seconds.get(managed.name)
-            if samples:
-                return _median(samples)
-        return self._config.fallback_startup_seconds
+        samples = self._startup_seconds.get(managed.name) if managed is not None else None
+        if not samples:
+            return self._config.fallback_startup_seconds
+        # 最大的变量是"世界数据还在不在系统缓存里" —— 按停机时长分冷 / 热两桶，
+        # 当前情境对应的桶里样本够（≥2 个）就用它，否则退回全体中位数
+        down = self._down_seconds(managed)
+        hot_window = self._config.hot_startup_window
+        if down is not None and hot_window > 0:
+            want_hot = down <= hot_window
+            bucket = [seconds for seconds, gap in samples
+                      if gap is not None and (gap <= hot_window) == want_hot]
+            if len(bucket) >= 2:
+                return _median(bucket)
+        return _median([seconds for seconds, _gap in samples])
+
+    def _down_seconds(self, managed: Optional[ManagedServer]) -> Optional[float]:
+        """这台服已经停了多久（秒）；不知道（本次会话里没停过）就返回 None。"""
+        if managed is None or managed.last_stopped_at <= 0:
+            return None
+        return max(0.0, time.monotonic() - managed.last_stopped_at)
 
     def eta_of(self, server: str) -> float:
         """给玩家看的"预计启动耗时"：优先用实测值，否则用配置里的兜底值。"""
         return self._eta(self._managed.get(server))
 
     # ================================================================== 假服务端回调
-
-    def _on_login_attempt(self, name: str, player: Optional[str], peer: str) -> None:
-        managed = self._managed.get(name)
-        if managed is None:
-            return
-        now = time.monotonic()
-        # 名字是客户端握手时自己报的，先过滤：它会被拼进 tellraw / playsound 命令里执行
-        player = safe_player_name(player) or None
-        managed.record_attempt(player, now, self._config.player_attempt_window)
-        self._logger.info(f'{player or "未知玩家"}（{peer}）正在连接休眠中的 {name}，'
-                          f'自动唤醒={managed.entry.auto_wake} 锁定={managed.locked}')
-        if managed.entry.auto_wake and not managed.locked:
-            self.wake_server(name, reason='connect', by='player', trigger_player=player)
 
     # ================================================================== 通知
 
@@ -1501,76 +1377,6 @@ class Supervisor:
 
     # ================================================================== 总线
 
-    def _on_bus_message(self, message: dict) -> Optional[dict]:
-        mtype = message.get('type')
-        if mtype == 'announce':
-            text = str(message.get('text') or '')
-            if message.get('kind') == 'tell':
-                player = str(message.get('player') or '')
-                self._tell_local(player, text)
-                return {'ok': True, 'delivered': self._has_player(player)}
-            if message.get('kind') == 'sound':
-                player = str(message.get('player') or '')
-                self._play_local(player, str(message.get('sound') or ''))
-                return {'ok': True, 'delivered': self._has_player(player)}
-            self._say_local(text)
-            return {'ok': True}
-        if mtype == 'state':
-            return {
-                'ok': True,
-                'instance': self.instance_name,
-                'servers': [v.to_dict() for v in self.local_views()],
-            }
-        if mtype == 'action':
-            return self._handle_remote_action(message)
-        return {'ok': False, 'reason': f'未知消息类型 {mtype!r}'}
-
-    def _handle_remote_action(self, message: dict) -> dict:
-        """处理别的实例发来的操作请求。
-
-        ⚠️ 必须**立刻应答**：休眠要等服务端停稳 + 端口移交（几十秒），
-        而请求方等应答只有总线超时那么久（默认 3 秒）。以前在这里同步执行，
-        于是请求方等到超时、什么也没收到（结果就是那句误报"本实例不负责 X"）。
-        真正的执行放到后台线程，请求方靠轮询状态确认结果（见 _wait_remote_state）。
-        """
-        action = message.get('action')
-        name = message.get('server')
-        by = str(message.get('by') or self.tr('command.source.remote'))
-        managed = self._managed.get(name)
-        not_managed = (False, self.tr('action.not_managed', server=name))
-
-        if action in ('wake', 'sleep'):
-            if managed is None:
-                ok, detail = not_managed
-            elif managed.action_in_progress:
-                ok, detail = True, self.tr('action.accepted')
-            elif action == 'sleep':
-                # ⚠️ 先**同步**过一遍"现在到底能不能休眠"再转后台：
-                # 以前这里不检查、直接回"已受理"，`_can_sleep` 的拒绝只留在本实例日志里，
-                # 请求方于是对着状态干等到 `_wait_remote_state` 超时（线上反馈：
-                # 玩家在别的服敲了 !!ig sleep，只看到"正在休眠…"，三分钟后才等到"等待超时"，
-                # 真正的原因"这台服上还有人"从没回到他那边）。
-                allowed, why_not = self.precheck_sleep(name)
-                if allowed:
-                    ok, detail = self._sleep_in_background(name, reason='remote', by=by)
-                else:
-                    ok, detail = False, why_not
-                    self._logger.info(f'{name}: 拒绝休眠（remote，{by}）—— {why_not}')
-            else:
-                ok, detail = self.wake_server(name, reason='remote', by=by)
-        elif action in ('lock', 'unlock'):
-            if managed is None:
-                ok, detail = not_managed
-            else:
-                managed.locked = (action == 'lock')
-                if not managed.locked:
-                    managed.wake_failures = 0
-                ok, detail = True, self.tr('action.locked' if managed.locked else 'action.unlocked',
-                                           server=name)
-        else:
-            ok, detail = False, self.tr('action.unknown_op', action=repr(action))
-        return {'ok': ok, 'reason': detail, 'instance': self.instance_name}
-
     def precheck_sleep(self, name: str) -> Tuple[bool, str]:
         """**不阻塞**地判断"现在到底能不能休眠"，返回 (可以, 不能的理由)。
 
@@ -1645,11 +1451,70 @@ class Supervisor:
                     view.local = False
                     merged[view.name] = view
                     live.add(view.name)
+                    if instance:
+                        self._owner_name[view.name] = instance
+                        self._mark_peer_alive(instance)
                 elif target is None:
                     merged[view.name] = view
                 elif not target.instance and view.instance:
                     target.instance = view.instance
+        self._apply_owner_health(merged)
         return merged, live
+
+    def _apply_owner_health(self, merged: Dict[str, ServerView]) -> None:
+        """给"别人负责的服"补上负责人，并标出那个实例是否还联系得上。
+
+        为什么需要：没有这层的话，「这台服根本没人管」与「管它的实例掉线了」在状态表里
+        长得一模一样（都是"只监视" + 备注 `-`），管理员看不出该去启动哪台 MCDR
+        （线上真踩到过：另一台实例没运行，这边的回复却是"没有实例负责 xxx"）。
+        """
+        for name, view in merged.items():
+            if view.role in MANAGED_ROLES:
+                continue                      # 自己负责的，在线状态就是自己
+            owner = view.instance or self._owner_name.get(name, '')
+            if not owner:
+                continue                      # 从来没见谁管过它：保持原样，备注显示 `-`
+            view.instance = owner
+            view.owner_online = self._is_instance_online(owner)
+
+    def _mark_peer_alive(self, instance: str) -> None:
+        """刚跟这台实例通过话（用于 live_views 这种临时查询的结果）。"""
+        for health in self._peer_health.values():
+            if health.get('instance') == instance:
+                health.update(ok=True, at=time.monotonic(), error='')
+                return
+        self._peer_health[f'?{instance}'] = {'ok': True, 'at': time.monotonic(),
+                                             'error': '', 'instance': instance}
+
+    def _is_instance_online(self, instance: str) -> bool:
+        """那台实例现在还能联系上吗。
+
+        注意：**从没跟它打过交道的，不当成离线**（否则插件刚启动时会满屏误报）。
+        """
+        seen = [health for health in self._peer_health.values()
+                if health.get('instance') == instance]
+        if not seen:
+            return True
+        return any(health.get('ok') for health in seen)
+
+    def _poll_peers(self) -> None:
+        """心跳里顺便问一句对端实例在不在。
+
+        状态表要能区分「没人管」与「管它的实例掉线了」，就得有个持续的健康检查；
+        顺便把失败原因（`Bus.last_error`）记下来，`!!ig diag` 直接展示。
+        """
+        for address in self._peer_addresses():
+            entry = self._peer_health.setdefault(address, {})
+            reply = self._bus.send(address, {'type': 'state'}, timeout=1.5)
+            if reply and reply.get('ok'):
+                entry.update(
+                    ok=True, at=time.monotonic(), error='',
+                    instance=str(reply.get('instance') or entry.get('instance', '')),
+                )
+            else:
+                read_error = getattr(self._bus, 'last_error', None)
+                reason = read_error(address) if callable(read_error) else ''
+                entry.update(ok=False, at=time.monotonic(), error=reason or '对端没有应答')
 
     # ================================================================== 事件入口
 
@@ -1678,6 +1543,7 @@ class Supervisor:
                 managed.stop_event.set()
                 managed.players.clear()
                 managed.started_at = None
+                managed.last_stopped_at = time.monotonic()
                 if managed.state == State.STOPPING:
                     # sleep_server 会接着做后续处理
                     continue
@@ -1808,6 +1674,32 @@ class Supervisor:
             if matched:
                 self.on_player_left(matched.group('name'))
                 return
+        self._note_busy_output(content)
+
+    def _note_busy_output(self, content: str) -> None:
+        """服务端说"我在备份/保存"时，记下"先别关它"。
+
+        为什么要这样：插件原来只看"有没有玩家"，完全不知道服务端正在干什么 ——
+        备份跑到一半被休眠打断，备份就废了（管理员装的备份插件越多，越容易撞上）。
+        命中之后只推迟**自动**休眠，且不重置空闲计时：备份结束后的下一轮就会照常关服。
+        """
+        patterns = self._busy_patterns
+        if not patterns:
+            return
+        for pattern in patterns:
+            if pattern.search(content):
+                now = time.monotonic()
+                hold = self._config.busy_hold_seconds
+                for managed in self._managed.values():
+                    if managed.role != 'self':
+                        continue
+                    managed.busy_until = now + hold
+                    managed.busy_reason = content[:120]
+                    self._logger.info(
+                        f'{managed.name}: 服务端正在忙（匹配到 {pattern.pattern!r}），'
+                        f'延后自动休眠判定 {int(hold)} 秒'
+                    )
+                return
 
     # ================================================================== 工具
 
@@ -1831,87 +1723,6 @@ class Supervisor:
         subprocess.Popen(command, cwd=cwd, shell=True)  # noqa: S602 - 命令来自管理员自己的配置
 
     # ---- 供命令模块使用的操作入口（会自行广播到其它实例） ----
-
-    def request_action(self, action: str, server: str, by: str = 'console',
-                       wait: bool = False) -> Tuple[bool, str]:
-        """执行一个操作（sleep / wake / lock / unlock）。
-
-        ``wait=True`` 时会等到操作真正有结果（服务端停稳 / 启动就绪，或远程实例报出新状态）
-        再返回 —— 命令层把它放在后台线程里调用，所以不会卡住 MCDR。
-        """
-        if server in self._managed:
-            if action == 'wake':
-                return self.wake_server(server, reason='manual', by=by, blocking=wait)
-            if action == 'sleep':
-                return self.sleep_server(server, reason='manual', by=by)
-            if action in ('lock', 'unlock'):
-                managed = self._managed[server]
-                if action == 'lock':
-                    managed.locked = True
-                else:
-                    managed.locked = False
-                    managed.wake_failures = 0
-                return True, self.tr('action.locked' if managed.locked else 'action.unlocked', server=server)
-            return False, self.tr('action.unknown_op', action=repr(action))
-
-        # 广播给**别的**实例，只有负责该服的实例会应答 ok。
-        # ⚠️ 必须排除自己：否则本实例会先回一句"本实例不负责 X"，
-        # 而远端真正执行休眠/唤醒要几十秒、早就超过总线超时了 —— 于是那句误报会盖掉真正的结果
-        # （线上真实踩到：`!!ig sleep Creative` 明明生效了，却回"本实例不负责 Creative"）。
-        replies = [reply for reply in
-                   (self._bus.send(address, {'type': 'action', 'action': action, 'server': server, 'by': by})
-                    for address in self._peer_addresses())
-                   if reply]
-        accepted = next((reply for reply in replies if reply.get('ok')), None)
-        if accepted is not None:
-            detail = str(accepted.get('reason') or self.tr('action.accepted'))
-            if not wait or action in ('lock', 'unlock'):
-                return True, detail
-            return self._wait_remote_state(server, action, detail)
-        if replies:
-            # 有实例应答了，但都说自己不负责（比如它那条的 role 是 watch）
-            return False, str(replies[0].get('reason') or self.tr('action.failed'))
-
-        # 一个应答都没有：负责它的实例不在线，或者这条没配总线地址
-        addresses = self._peer_addresses()
-        entry = next((e for e in self._config.servers if e.name == server), None)
-        role = entry.role if entry is not None else 'watch'
-        # 提示要说对病因：role 已经是 auto 时，再劝人"把 role 改成 auto"是废话
-        # （线上真踩到过：管理员照做了，结果提示一字未变）
-        hint = self.tr('action.hint_auto' if role == 'auto' else 'action.hint_own',
-                       server=server, role=role)
-        # 连失败原因一起记：只说"没人应答"没法排查，得看清是连不上、鉴权失败还是对端没回
-        last_error = getattr(self._bus, 'last_error', None)
-        tried = []
-        for address in addresses:
-            reason = last_error(address) if callable(last_error) else ''
-            tried.append(f'{address}（{reason}）' if reason else address)
-        self._logger.warning(self.tr('action.no_owner_none_answered', server=server, action=action,
-                                      addresses='、'.join(tried) if tried else '无'))
-        if entry is not None and not entry.bus:
-            return False, self.tr('action.no_remote_bus', server=server, hint=hint)
-        return False, self.tr('action.no_owner', server=server, hint=hint)
-
-    def _wait_remote_state(self, server: str, action: str, accepted_detail: str) -> Tuple[bool, str]:
-        """等远程实例上的目标状态出现（或超时）。"""
-        timeout = (self._config.startup_timeout if action == 'wake' else self._config.stop_timeout) + 30.0
-        wanted = {State.RUNNING.value} if action == 'wake' else {State.SLEEPING.value, State.OFFLINE.value}
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and not self._stopping.is_set():
-            view = self._lookup_view(server)
-            if view is not None and view.state in wanted:
-                if action == 'wake':
-                    return True, self.tr('action.wake_done_simple', server=server)
-                return True, self.tr('action.sleep_stopped', server=server)
-            time.sleep(2.0)
-        return False, self.tr('action.wait_timeout', server=server, seconds=int(timeout))
-
-    def _lookup_view(self, server: str) -> Optional[ServerView]:
-        try:
-            return self.status_views().get(server)
-        except Exception as exc:  # noqa: BLE001
-            self._logger.debug(f'查询 {server} 状态失败：{type(exc).__name__}: {exc}')
-            return None
 
     def state_of(self, server: str) -> Optional[ManagedServer]:
         return self._managed.get(server)
