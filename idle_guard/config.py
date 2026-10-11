@@ -14,6 +14,16 @@ from typing import List, Optional
 
 from mcdreforged.api.utils import Serializable
 
+#: "服务端正在忙"的默认特征：常见备份插件的开始文案。
+#: 故意**不含**原版的 `Saving the game` —— 那是几十毫秒级的例行保存，
+#: 每次都延后一轮判定没有意义（真想拦它自己加进 busy_patterns 即可）。
+DEFAULT_BUSY_PATTERNS = (
+    r'(?i)\bbacking up\b',
+    r'(?i)\bbackup (?:has )?(?:started|begun|complete|completed|finished)\b',
+    r'(?i)\b(?:creating|preparing|starting) (?:the )?(?:world |server )?backup\b',
+    r'(?i)\bworld backup (?:started|created)\b',
+)
+
 
 @dataclass
 class ServerEntry(Serializable):
@@ -33,6 +43,10 @@ class ServerEntry(Serializable):
     auto_sleep: bool = True
     #: 有人尝试连接时是否允许自动唤醒
     auto_wake: bool = True
+    #: 常驻：**永不休眠**。适合"希望长期开着"的子服 —— 自动判定不会关它，
+    #: 管理员手敲 `!!ig sleep`（含从别的实例发来的）也会被拒绝。
+    #: 要临时关掉它，把这里改成 false 再 `!!ig reload`。
+    always_on: bool = False
     #: 该子服所属 MCDR 实例的总线地址，如 "127.0.0.1:25600"；填了才能跨服通知/远程控制
     bus: Optional[str] = None
     #: role=command 时使用；启动命令（走 shell，支持 Windows 的 start.bat）
@@ -118,6 +132,9 @@ class Config(Serializable):
     wake_cooldown: float = 15.0
     #: 首次唤醒时用于提示的预计启动耗时（秒）；之后会用实测值
     fallback_startup_seconds: float = 60.0
+    #: "热启动"的判定窗口（秒）：服务端停止后**这么快之内**又被唤醒的，算热启动
+    #: （世界数据多半还在系统缓存里、起得更快）。ETA 会按冷 / 热分别统计。
+    hot_startup_window: float = 300.0
     #: 记住"谁尝试进入过"的时长（秒），用于服务端起来后单独提醒
     player_attempt_window: float = 600.0
     #: 统计玩家数时忽略的玩家名（正则，例如假人：["^bot_", "^Bot"]）
@@ -126,6 +143,18 @@ class Config(Serializable):
     max_wake_failures: int = 3
     #: `!!ig sleep` 发出后，等多久之内可以用 `!!ig confirm` 确认（秒）
     confirm_timeout: float = 30.0
+    #: Velocity 配置文件（`velocity.toml`）的路径。
+    #: `auto` = 自动在 MCDR 工作目录附近查找；`off` / `''` = 关闭这个同步。
+    #: 打开时，插件启动会把 velocity.toml 的 `[servers]` 段里**还没写进 servers[]** 的子服
+    #: 自动补进来（名字、地址、端口），已有条目的设置一律不动。
+    velocity_config: str = 'auto'
+    #: 服务端输出里命中这些正则时，认为它"正在忙"（备份 / 保存），这期间**不做自动休眠**。
+    #: 只拦自动休眠：管理员手敲的 `!!ig sleep` 照常执行（你明确要关，插件不拦）。
+    #: 默认覆盖常见的备份插件文案；不需要就把列表清空成 `[]`。
+    busy_patterns: List[str] = field(default_factory=lambda: list(DEFAULT_BUSY_PATTERNS))
+    #: 命中一次"忙"之后，往后这么多秒内不做自动休眠（秒）。到点自动失效，
+    #: 所以不需要服务端再打印一条"备份结束"（那种日志各家写法都不一样、靠不住）。
+    busy_hold_seconds: float = 300.0
     #: 打印详细调试日志
     debug: bool = False
 

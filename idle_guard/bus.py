@@ -17,7 +17,8 @@ import json
 import os
 import socket
 import threading
-from typing import Callable, Iterable, List, Optional
+import time
+from typing import Callable, Dict, Iterable, List, Optional
 
 #: 单条消息的最大长度，防止被超大报文打爆内存
 MAX_MESSAGE_SIZE = 1 << 20
@@ -64,6 +65,9 @@ class Bus:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._stop_event = threading.Event()
+        #: 最近一次发往某地址失败的原因（发送成功即清掉）。
+        #: 用途：对端"一个应答都没有"时，光说"没人应答"没法排查 —— 把原因捞出来给管理员看。
+        self._last_errors: Dict[str, str] = {}
 
     # ------------------------------------------------------------------ 生命周期
 
@@ -129,6 +133,7 @@ class Bus:
         """向一个地址发送消息并等待应答；失败返回 None（不抛异常）。"""
         parsed = parse_address(address)
         if parsed is None:
+            self._note_error(address, f'地址非法：{address!r}')
             self._logger.debug(f'忽略非法总线地址：{address!r}')
             return None
         host, port = parsed
@@ -140,13 +145,30 @@ class Bus:
                 self._write(sock, {'type': 'hello', 'token': self._token})
                 ack = self._read(reader)
                 if not ack or not ack.get('ok'):
+                    self._note_error(address, f'鉴权失败（对端 token 与本实例不一致？）：{ack}')
                     self._logger.debug(f'{address} 总线鉴权失败：{ack}')
                     return None
                 self._write(sock, message)
-                return self._read(reader)
+                reply = self._read(reader)
+                if reply is None:
+                    self._note_error(address, '连上了但没在超时内收到应答（对端接受线程可能已失效）')
+                else:
+                    with self._lock:
+                        self._last_errors.pop(address, None)
+                return reply
         except (OSError, ValueError) as exc:
+            self._note_error(address, f'{type(exc).__name__}: {exc}')
             self._logger.debug(f'总线消息发往 {address} 失败：{type(exc).__name__}: {exc}')
             return None
+
+    def _note_error(self, address: str, reason: str) -> None:
+        with self._lock:
+            self._last_errors[address] = reason
+
+    def last_error(self, address: str) -> str:
+        """最近一次发往该地址失败的原因（发送成功过就为空）。用于排查"对端没应答"。"""
+        with self._lock:
+            return self._last_errors.get(address, '')
 
     def broadcast(self, addresses: Iterable[str], message: dict, timeout: Optional[float] = None) -> List[dict]:
         """并行地向多个地址广播，返回所有成功的应答。"""
@@ -208,8 +230,16 @@ class Bus:
                     return
             try:
                 conn, addr = sock.accept()
-            except OSError:
-                return
+            except OSError as exc:
+                if self._stop_event.is_set() or not self.running:
+                    return      # 正常停止：socket 被 close() 了
+                # ⚠️ 意外错误不能让接受线程直接退出：socket 还留在 LISTEN，
+                # 对端连得上、数据也发得出去，但**永远等不到应答** ——
+                # 在对方看来就是"那个实例不在线"（真实踩过，排查了很久）。
+                # 所以这里记一条日志、歇一下继续转。
+                self._logger.warning(f'总线接受连接出错（{type(exc).__name__}: {exc}），1 秒后继续')
+                time.sleep(1.0)
+                continue
             threading.Thread(
                 target=self._handle_conn,
                 args=(conn, f'{addr[0]}:{addr[1]}'),

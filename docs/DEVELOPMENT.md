@@ -34,6 +34,7 @@
 | `fakeserver.py` | 休眠期间顶替游戏端口的假服务端：应答状态查询、接住登录并触发唤醒 |
 | `bus.py` | 实例间 TCP 总线（带 token 鉴权） |
 | `config.py` | 配置数据类与默认值 |
+| `velocity.py` | 读 `velocity.toml` 的 `[servers]` 段（找文件 + 解析，不依赖 tomllib） |
 | `i18n.py` + `lang/*.json` | 多语言文案与覆盖机制 |
 
 ## 设计要点与理由
@@ -94,8 +95,14 @@
 
 ## 状态与角色
 
-状态取值：`unknown` / `offline` / `starting` / `running` / `stopping` / `sleeping`。
+状态取值：`unknown` / `offline` / `starting` / `running` / `stopping` / `sleeping` / `stopped`。
 本实例负责的子服由轮询与事件维护，其余子服以状态查询结果为准。
+
+`stopped` 与 `sleeping` 的区别（别混）：`sleeping` 是**插件自己**让它睡的，假服务端占着端口，
+玩家连接会唤醒；`stopped` 是**外部**停的（后台敲 `stop`、服务端自己优雅退出），插件不接管端口、
+也不会替玩家开服。判定依据是服务端的退出码：0 记 `stopped`，非 0（崩溃 / 被强杀）才走
+"假服务端接管 + 留住 MCDR"的兜底。服务端重新起来（`on_server_startup`）或插件明确休眠 / 唤醒时，
+`external_stop` 标记清掉，恢复托管。
 
 角色的含义（`role`）：`self` = 本实例用 MCDR 启停；`command` = 本实例用命令启停；
 `watch` = 只监视；`auto` = 按 `server.properties` 端口自动判定。前两者才是 `MANAGED_ROLES`。
@@ -134,13 +141,56 @@
   会拼进 `tellraw` / `playsound` 命令。
 - **音效要带 `execute at`**：写成 `execute at <player> run playsound <sound> master <player> ~ ~ ~ 1 1`，
   漏掉 `execute at` 时声源落在世界原点，玩家离得远就听不见。
-- **启动耗时落盘复用**：本次实测 → 上次存盘 `config/idle_guard/startup_seconds.json` →
-  `fallback_startup_seconds`，插件重载或 MCDR 重启都不会退回兜底值。
-- **服务端意外停止时要阻止 MCDR 退出**：MCDR 每次启动服务端都会打上 `EXIT_AFTER_STOP`,
-  非插件方式停服会让 MCDR 跟着退出、假服务端一起消失。`on_server_stop` 的意外分支里调
-  `set_exit_after_stop_flag(False)`。
+- **常驻子服的判定点有两处**：`_check_idle` 的 `sleep_allowed`（不自动关）与 `_can_sleep`
+  （手动 / 远程 / 空闲三条路都经过它）。命令层 `_precheck_message` 也提前拦一次，
+  好让管理员在输入 `!!ig confirm` 之前就知道关不了。`always_on` 会随 `ServerView` 一起过总线，
+  别的实例的状态表也能显示「常驻」。
+- **子服清单同步只在启动时做一次**：`Supervisor.__init__` 里 `_sync_servers_from_velocity()`
+  先跑，再 `_compile_config()`（因为 `role: auto` 的判定要靠这些条目）。原则是**只补不改**：
+  缺的补上、已有条目一个字段都不动、地址对不上只 warning；补过之后才写回 `config.json`，
+  平时不动用户的配置文件。
+- **启动耗时落盘复用**：本次实测 → 每台服最近 8 次样本（`config/idle_guard/startup_seconds.json`）
+  的中位数 → `fallback_startup_seconds`。用中位数而不是"上一次"，是因为启动耗时抖动很大
+  （世界加载、mod 初始化、磁盘缓存冷热），照搬上一次经常差出好几倍。旧格式（单个数字）照样能读。
+- **唤醒完成的提示要能"存起来"**：玩家是被假服务端挡回客户端的，唤醒完成时他不在任何服务端里，
+  `announce.opened` 的广播与给他的 `tell` 都送不到。所以触发过唤醒的玩家会进
+  `ManagedServer.pending_greetings`，等他 `on_player_joined` 时补一条「已开启」+ 音效
+  （超过 `player_attempt_window` 才进来就不补了）。
+- **停止要分「正常」与「异常」两路**：`on_server_stop` 按退出码分流：0（后台 `stop`、服务端自己
+  优雅退出）记 `stopped`，不接管端口、不动 `EXIT_AFTER_STOP` 标记（管理员就是想用 `stop` 把实例关掉）；
+  非 0（崩溃 / 被强杀）才调 `set_exit_after_stop_flag(False)` 留住 MCDR，并让假服务端接管端口、
+  等玩家连接时自动开服。轮询每 tick 都会重算状态，所以这个结论必须由 `ManagedServer.external_stop`
+  这个标记承载，否则下一次心跳又会把它推成 `offline` → 假服务端 → `sleeping`。
 - **空闲计时与 `auto_sleep` 解耦**：`_check_idle` 照常维护 `empty_since`（浮窗要显示），
   只有 `role in MANAGED_ROLES and auto_sleep and not locked` 时才真的关服。
+
+## 一台 MCDR 管多台子服
+
+每个子服各跑一个 MCDR 是最省心的拓扑（跨服通知天然准确、每台状态都由它自己算），但 MCDR 也是常驻进程
+（每个大约 100~150 MB）。子服不多、或者不想开那么多进程时，可以让**一台 MCDR 管多台子服**：把那些条目
+写成 `role: command`，由这一个实例用命令启停它们。
+
+```jsonc
+"servers": [
+  { "name": "Survival", "host": "127.0.0.1", "port": 30000, "role": "command",
+    "start_command": "start-survival.bat", "stop_command": "stop-survival.bat",
+    "working_directory": "D:/servers/survival" },
+  { "name": "Creative", "host": "127.0.0.1", "port": 30001, "role": "command",
+    "start_command": "start-creative.bat", "stop_command": "stop-creative.bat",
+    "working_directory": "D:/servers/creative" }
+]
+```
+
+几个要点：
+
+- `stop_command` 要能**优雅**停服（例如向那个服务端的控制台发 `stop`，或调它自己的停止脚本）。
+  别用 `taskkill /F` 之类的强杀：世界来不及保存，插件这边也会把它当成"异常停止"。
+- 这类子服**没有 MCDR 事件兜底**，人数完全来自状态查询。所以务必让它们开着 `enable-status=true`，
+  否则插件"数不清人"时会保守地拒绝自动休眠（这是有意的安全行为，不是 bug）。
+- 总线：一台 MCDR 只有一个 `bus.bind`，所以它管的几条 `role: command` 条目共用同一个实例地址；
+  别的实例要操作这些子服，把它们的 `servers[].bus` 都指向这一个地址。
+- 代价要说清楚：这台 MCDR 一挂，它管的**全部**子服同时失去自动启停能力；跨服通知也只能进到
+  它管的那些服务端里。子服多于两三台时，还是一台一个实例更稳。
 
 ## 打包与测试
 
@@ -224,9 +274,14 @@ python test-network/stop_all.py
 
 ## 排错
 
-- **`!!ig sleep/wake <服>` 提示"没有实例负责 xxx"**：没有任何实例把该子服认领为自己的服务端。
-  常见原因：该子服所在的 MCDR 没装插件（或总线地址没配），或者配置里那条的 `role` 写成了
-  `watch`。检查该实例日志里有没有 `本实例负责的子服：xxx`。
+- **`!!ig sleep/wake <服>` 提示"没有实例负责 xxx"**：**一个实例都没有应答**。按 `role` 分两种情形：
+  - `role: auto`：该由 `server.properties` 端口与它一致的那台 MCDR 负责。回复按这个含义给提示，
+    控制台日志里还会写清试过哪些总线地址、各自为什么失败（连不上 / 鉴权失败 / 连上了却没应答）。
+    逐项查：那台实例是否在运行、是否装了本插件、`servers[].bus` 是否配对。日志里搜
+    `本实例负责的子服：xxx` 可以确认某个实例到底认领了谁。
+  - `role: watch` 等：没有任何实例会启停它，把该条改成 `auto` 或 `self`。
+- **前台看着"端口在监听"，可跨实例操作却说没人负责**：那个实例的总线接受线程可能已经不转了
+  （旧版遇到意外错误会直接停摆）。日志里搜 `总线接受连接出错`。新版本会记日志并继续接受连接。
 - **玩家已经退出，插件却说还有人**：看日志有没有 `状态查询已经连续 60 秒以上报"0 人在线"，
   但 MCDR 没有报告 xxx 离开`。有这行说明 MCDR 没解析出服务端的离开消息，插件已按查询结果纠正。
   连这行都没有，说明状态查询本身不通（服务端关了 `enable-status` 或端口探不通），这种"数不清人"
@@ -241,6 +296,7 @@ python test-network/stop_all.py
 - **改了配置 / 文案不生效**：执行 `!!ig reload` 或 `!!MCDR plugin reload idle_guard`。
 - **两个实例的总线端口写成同一个**：后启动的会在日志里报 `总线绑定 127.0.0.1:xxxxx 失败`，
   跨服通知与状态查询会缺一半。每台实例给一个不同的端口。
-- **服务端崩了或被手动关了**：插件会发现并让假服务端接管端口，玩家连接时照样能自动启动。
+- **服务端崩了**：插件会发现并让假服务端接管端口，玩家连接时照样能自动启动。**在后台敲 `stop`
+  正常关闭**不算崩溃：状态记为「已停止」，插件不接管端口，MCDR 也会照常随服务端一起退出。
 - **连续启动失败**（默认 3 次）会自动锁定自动唤醒，避免死循环刷屏，需管理员 `!!ig unlock`。
 - **服务端开了 `hide-online-players`**：拿不到可信人数时不会关服。

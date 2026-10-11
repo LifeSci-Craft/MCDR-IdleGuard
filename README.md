@@ -12,6 +12,8 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue)](https://www.python.org/)
 
+[English](README_en.md) | **简体中文**
+
 | | |
 |---|---|
 | 插件 ID | `idle_guard` |
@@ -35,9 +37,14 @@
 - 侦察走协议层状态查询（SLP）：不需要在任何子服装插件，也不需要开 RCON
 - 连续无人到阈值就自动休眠；阈值可以全局设，也可以按子服单独设
 - 休眠期间假服务端顶替该端口：服务器列表里显示「已休眠」，玩家连接会看到自定义提示并触发启动
-- 启动完成后广播「已开启（耗时 xx 秒）」，被挡回去的那位玩家另外收到一条提醒，可带音效
+- 启动完成后广播「已开启（耗时 xx 秒）」，被挡回去的那位玩家在真正进服时会收到一条提醒，可带音效
+- 子服清单可以从 Velocity 的 `velocity.toml` 自动读进来，不用手抄名字与端口
+- 希望长期开着的子服可以设成**常驻**（`always_on`）：不会自动关，也不接受休眠指令
 - 实例间总线：跨服通知，以及在任意一个实例上操作别的子服（`!!ig sleep creative`）
-- 每次启动的实测耗时落盘复用，报给玩家的「预计 xx 秒」来自上一台服务端的真实值
+- 每次启动的实测耗时落盘（保留最近 8 次），报给玩家的「预计 xx 秒」取其中位数，
+  并按「冷 / 热启动」分开统计（停机越久通常起得越慢）
+- 服务端在备份 / 保存期间**不做自动休眠**（`busy_patterns`），免得把备份打断
+- `!!ig diag` 一条命令看清「谁负责谁、总线通不通、为什么还不休眠」
 - 执行前先侦测状态：已经在休眠 / 正在变动 / 有人在线，都会直接说明而不做无意义动作
 - 中文 / English 双语，语言跟随 MCDR，也可以自己覆盖文案
 - 命令全部需要管理员权限
@@ -79,6 +86,8 @@
 | `!!ig confirm` / `!!ig cancel` | 确认 / 取消上一次待执行的休眠 |
 | `!!ig wake <编号 / 子服名>` | 唤醒，可跨实例下发 |
 | `!!ig lock` / `!!ig unlock <编号 / 子服名>` | 暂停 / 恢复这台子服上的自动休眠与自动唤醒 |
+| `!!ig diag` | 诊断页：认领依据 / 总线与对端健康度 / 休眠预检逐条结论 / ETA 样本 / 最近事件 |
+| `!!ig stats` | 休眠统计：次数、累计休眠时长、唤醒次数 |
 | `!!ig poll` | 立刻侦察一轮 |
 | `!!ig reload` | 重载插件与配置 |
 
@@ -111,10 +120,12 @@ survival 已休眠
   "check_interval": 600,                       // 侦察间隔（秒）
   "state_tick": 5,                             // 状态心跳（秒）
   "idle_timeout": 3600,                        // 连续无人多久后休眠（秒）
+  "velocity_config": "auto",                   // 从 velocity.toml 自动补子服清单；"off" = 关闭
   "servers": [
     { "name": "lobby",    "host": "127.0.0.1", "port": 25565, "role": "watch",
       "auto_sleep": false, "bus": "127.0.0.1:25600" },
     { "name": "survival", "host": "127.0.0.1", "port": 25566, "role": "auto",
+      "always_on": false,                    // true = 常驻，永不休眠
       "bus": "127.0.0.1:25601" }
   ],
   "bus": { "bind": "auto", "token": "改成你自己的口令" },
@@ -145,6 +156,10 @@ survival 已休眠
 | `ignore_players` | `[]` | 统计时忽略的名字（正则），可用来忽略假人 |
 | `max_wake_failures` | `3` | 连续启动失败几次后自动锁定 |
 | `confirm_timeout` | `30` | `!!ig confirm` 的有效期（秒） |
+| `velocity_config` | `"auto"` | Velocity 的 `velocity.toml` 路径。`auto` = 在 MCDR 工作目录附近自动找；`off` = 关闭。见下面「子服清单自动同步」 |
+| `busy_patterns` | 见下 | 命中这些正则就认为服务端「正在忙」（备份 / 保存），期间不做**自动**休眠；清空成 `[]` 可关闭 |
+| `busy_hold_seconds` | `300` | 命中一次「忙」之后，往后这么多秒不做自动休眠（到点自动失效，不依赖「备份结束」日志） |
+| `hot_startup_window` | `300` | 「热启动」的判定窗口（秒）：停机后这么快之内又被唤醒算热启动，ETA 按冷 / 热分别统计 |
 | `debug` | `false` | 在控制台打印每轮侦察的细节 |
 
 </details>
@@ -160,6 +175,7 @@ survival 已休眠
 | `role` | `"auto"` | 见下表 |
 | `auto_sleep` | `true` | 是否允许自动休眠（关掉后仍会显示空闲时长，只是不据此关服） |
 | `auto_wake` | `true` | 是否允许被玩家连接唤醒 |
+| `always_on` | `false` | **常驻**：自动判定不关它，`!!ig sleep`（含从别的实例发来的）也会被拒绝。适合希望长期开着的子服 |
 | `bus` | `""` | 该子服所在实例的总线地址，每台一个端口 |
 | `start_command` | `null` | `role: command` 时用 |
 | `stop_command` | `null` | `role: command` 时用 |
@@ -179,6 +195,13 @@ survival 已休眠
 `role: auto` 加上 `bus.bind: "auto"` 之后，**同一份配置可以原封不动复制到每台 MCDR**：
 每个实例按 `server.properties` 的端口认出自己是谁，并取对应条目的 `bus` 地址当自己的监听地址。
 需要为每台机器区分的只有 `servers[].bus` 这一列。
+
+**子服清单自动同步（`velocity_config`）**：Velocity 里本来就写着每个子服的名字与地址，不必再手抄一遍。
+插件启动时会读一遍 `velocity.toml` 的 `[servers]` 段，把**还没写进 `servers[]`** 的条目补进来
+（新条目用默认值：`role: auto`、允许自动休眠与唤醒），然后把结果写回 `config.json`，你可以接着改。
+**已有条目一律不动**：`role` / `auto_sleep` / `always_on` / `bus` 这些是你手写的，若地址与 Velocity
+里对不上，只会在控制台提醒一句、保留你的配置。`auto` 会在 MCDR 工作目录、上一级、`Velocity/`
+等常见位置找 `velocity.toml`；找不到就安静跳过，不影响运行。不想用它就写 `"off"`。
 
 </details>
 
@@ -237,7 +260,16 @@ survival 已休眠
   （默认值对 Paper 的日志解析率实测为 0%，玩家事件会完全收不到）。
 - MCDR 必须常驻：它一关，假服务端也就没了。另注意 MCDR 2.x 的 `!!MCDR stop` 在控制台无效，
   停服用 `stop`。
+- **在后台敲 `stop` 停服不会被当成休眠**：服务端正常退出后状态显示「已停止」，插件不会接管端口，
+  玩家连接也不会自动开服（MCDR 会照常随服务端一起退出）。想让这台子服回到「玩家连接时自动唤醒」
+  的休眠态，用 `!!ig wake` 把它开起来即可。只有服务端**异常退出**（崩溃、被强杀）时，插件才会挂上
+  假服务端兜底，等玩家连接时自动开服。
 - Windows 上第一次接管端口时可能弹防火墙授权框，需要允许，否则玩家连接会被系统丢包。
+- **状态表里的 `@实例名(离线)`**：负责它的那台 MCDR 现在联系不上（这跟「没人管它」是两回事）。
+  `!!ig diag` 会说明具体是连不上、鉴权失败还是连上了没应答。
+- **备份期间不会被自动休眠**：命中 `busy_patterns`（默认覆盖常见的备份插件文案）就延后一轮判定。
+  你那台备份插件的文案如果不一样，把它那行加进 `busy_patterns` 即可。管理员手敲的 `!!ig sleep`
+  不受这条限制。
 - **权限**：命令门槛固定为 MCDR 等级 3（ADMIN），`config.json` 里没有权限开关。要放行某人就在
   MCDR 的 `permission.yml` 里把他的名字填进 `owner`/`admin`。⚠️ 那里的玩家名**大小写敏感**且精确匹配
   （`Paulam` ≠ `PaulAm`），写错会退回 `default_level`，表现为「明明配了却提示权限不足」。
