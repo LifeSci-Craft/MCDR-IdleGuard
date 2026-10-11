@@ -58,7 +58,10 @@ def build(servers: int, *, fake: bool) -> Supervisor:
         announce=AnnounceConfig(enabled=False),
         servers=entries,
     )
-    return Supervisor(StubMCDR(), config, plugin_version='soak')
+    stub = StubMCDR()
+    # 模拟"服务端没在跑"：这样才会走"假服务端接管端口"那条路（默认桩是运行中）
+    stub.running = False
+    return Supervisor(stub, config, plugin_version='soak')
 
 
 def sample() -> tuple:
@@ -73,8 +76,18 @@ def main() -> int:
     parser.add_argument('--servers', type=int, default=2, help='配置里放几台子服')
     parser.add_argument('--fake-cycles', type=int, default=0,
                         help='另外做多少次"起假服务端 → 撤下"的循环')
-    parser.add_argument('--sample-every', type=int, default=250, help='每多少轮采样一次')
+    parser.add_argument('--sample-every', type=int, default=100, help='每多少轮采样一次')
+    parser.add_argument('--real-probe', action='store_true',
+                        help='用真实的状态查询（慢；默认用一个"立即返回不可达"的替身，'
+                             '这样压的是心跳/状态机/线程，而不是网络超时）')
     args = parser.parse_args()
+
+    if not args.real_probe:
+        import idle_guard.supervisor as supervisor_module
+        from idle_guard.mcproto import PingResult
+        supervisor_module.status_ping = (
+            lambda host, port, timeout=1.5, **kwargs: PingResult(online=False, error='soak: 模拟不可达')
+        )
 
     supervisor = build(args.servers, fake=args.fake_cycles > 0)
     print(f'轮数 {args.rounds}，子服 {args.servers} 台，间隔 {args.interval}s，'
