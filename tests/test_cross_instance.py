@@ -236,3 +236,84 @@ def test_wake_stops_the_fake_server_and_waits_for_the_port(two_instances):
     stub_b.started_up = True
     instance_b.on_server_startup()
     assert wait_until(lambda: managed.state == State.RUNNING, 15)
+
+
+# --------------------------------------------------------------------------- #
+# 6. 谁都没应答时的提示与诊断
+# --------------------------------------------------------------------------- #
+
+def test_auto_role_hint_does_not_tell_you_to_set_auto(two_instances):
+    """线上反馈：role 本来就是 auto，提示却还在劝"把 role 改成 auto 或 self"，
+    照做之后回复一字未变。
+
+    role=auto 的含义是"该由 server.properties 端口与它一致的那台 MCDR 负责"，
+    所以这种情形下提示要指向"那台实例没应答"，改 role 是改不出结果的。
+    """
+    instance_a, _instance_b, *_rest = two_instances
+    instance_a.config.servers[1].role = 'auto'
+    instance_a.config.servers[1].bus = '127.0.0.1:1'      # 没人监听的地址 = 对方实例不在线
+    ok, detail = instance_a.request_action('wake', 'Creative', by='测试', wait=True)
+    assert not ok
+    assert '改成 auto' not in detail, detail
+    assert '在运行' in detail, detail
+
+
+def test_nobody_answered_is_logged_with_the_address_and_reason(two_instances):
+    """一个应答都没有时，控制台要留下"试过哪些地址、各自为什么失败"——
+    只有"没有实例负责"这一句在玩家那边，管理员根本无从查起。"""
+    instance_a, _instance_b, stub_a, *_rest = two_instances
+    instance_a.config.servers[1].role = 'auto'
+    instance_a.config.servers[1].bus = '127.0.0.1:1'
+    instance_a.request_action('wake', 'Creative', by='测试', wait=True)
+    log = stub_a.logger.text()
+    assert '没有任何实例应答' in log, log[-800:]
+    assert '127.0.0.1:1' in log, log[-800:]
+
+
+def test_bus_remembers_why_a_send_failed():
+    """总线必须留下失败原因（连不上 / 鉴权失败 / 连上了但没应答），否则没法排查。"""
+    from idle_guard.bus import Bus
+    from mc_test_utils import CollectingLogger
+
+    bus = Bus(None, 'token', lambda message: {'ok': True}, CollectingLogger())
+    assert bus.send('127.0.0.1:1', {'type': 'state'}, timeout=0.5) is None
+    assert bus.last_error('127.0.0.1:1'), '没有记录失败原因'
+
+
+def test_bus_keeps_accepting_after_an_unexpected_error(monkeypatch):
+    """接受线程遇到意外 OSError 不能直接退出。
+
+    否则 socket 还留在 LISTEN 状态：对端连得上、消息也发得出去，但永远等不到应答，
+    在对方看来就是"那台实例不在线"（真实踩过，查了很久）。
+    """
+    import socket as socket_module
+
+    from idle_guard.bus import Bus
+    from mc_test_utils import CollectingLogger
+
+    port = free_port()
+    bus = Bus(f'127.0.0.1:{port}', 'token',
+              lambda message: {'ok': True, 'echo': message.get('type')},
+              CollectingLogger(), timeout=2.0)
+    real_accept = socket_module.socket.accept
+    calls = {'n': 0}
+
+    def flaky_accept(self):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise OSError('模拟一次意外错误')
+        return real_accept(self)
+
+    monkeypatch.setattr(socket_module.socket, 'accept', flaky_accept)
+    try:
+        assert bus.start(), '总线没能启动'
+        reply = None
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline and reply is None:
+            reply = bus.send(f'127.0.0.1:{port}', {'type': 'state'}, timeout=1.0)
+            if reply is None:
+                time.sleep(0.5)
+        assert reply is not None and reply.get('echo') == 'state', (
+            f'接受线程没能恢复（accept 被调用 {calls["n"]} 次）')
+    finally:
+        bus.stop()
