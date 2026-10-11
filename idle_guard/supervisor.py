@@ -1120,7 +1120,7 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             self._remember_startup_seconds(name, elapsed, self._down_seconds(managed))
             managed.wake_failures = 0
             managed.started_at = time.monotonic()
-            managed.last_stopped_at = 0.0
+            managed.last_stopped_at = None
             managed.empty_since = None
             managed.warned = False
             self._set_state(managed, State.RUNNING, '')
@@ -1289,8 +1289,13 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         return _median([seconds for seconds, _gap in samples])
 
     def _down_seconds(self, managed: Optional[ManagedServer]) -> Optional[float]:
-        """这台服已经停了多久（秒）；不知道（本次会话里没停过）就返回 None。"""
-        if managed is None or managed.last_stopped_at <= 0:
+        """这台服已经停了多久（秒）；不知道（本次会话里没停过）就返回 None。
+
+        判的是 None 而不是 `<= 0`：哨兵要是用 0 表达"没停过"，就会和真实时刻
+        挤在同一条数轴上 —— 刚启动的容器里 `monotonic()` 可能还不到 7200 秒，
+        `monotonic() - 7200` 是负数，会被误判成"没停过"，冷 / 热分桶就失效了。
+        """
+        if managed is None or managed.last_stopped_at is None:
             return None
         return max(0.0, time.monotonic() - managed.last_stopped_at)
 

@@ -87,8 +87,11 @@ class ManagedServer:
         self.launch_started: Optional[float] = None
         self.started_at: Optional[float] = None
         #: 上一次"服务端停下来"的时刻（monotonic）：用来算"停机多久后又被唤醒"，
-        #: 冷 / 热启动的 ETA 靠它分桶。0 = 这次会话里还没停过
-        self.last_stopped_at: float = 0.0
+        #: 冷 / 热启动的 ETA 靠它分桶。None = 这次会话里还没停过。
+        #: ⚠️ 哨兵值故意不用 0.0 —— 那会和真实时刻共用一条数轴：
+        #: monotonic 是"开机以来的秒数"，在刚启动的容器里它可能还不到 7200，
+        #: `monotonic() - 7200` 就成了负数，于是被判成"没停过"。
+        self.last_stopped_at: Optional[float] = None
         self.last_startup_seconds: Optional[float] = None
 
         self.players: set = set()
