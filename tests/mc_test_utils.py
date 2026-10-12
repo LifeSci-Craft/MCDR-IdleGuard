@@ -5,7 +5,7 @@ import json
 import logging
 import socket
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 from idle_guard.mcproto import (
     ConnReader,
@@ -16,12 +16,28 @@ from idle_guard.mcproto import (
     parse_string,
 )
 
+#: 本次进程已经发出去过的端口号：保证两次 `free_port()` 不会拿到同一个值。
+_ISSUED_PORTS: Set[int] = set()
+
 
 def free_port() -> int:
-    """取一个当前空闲的 TCP 端口号。"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(('127.0.0.1', 0))
-        return int(sock.getsockname()[1])
+    """取一个当前空闲、且**本次进程内没发过**的 TCP 端口号。
+
+    ⚠️ 不能"绑一次 0 号端口、拿到号就撒手"就完事：内核（尤其 Linux）会把刚释放的
+    临时端口**立刻再发一次**，于是"两次调用拿到两个不同端口"这件事并不成立。
+    症状是随机失败：两条子服条目拿到同一个端口，配置层判定"有多个条目写了同一端口"
+    而拒绝按端口认领角色（CI 的 Python 3.9 那次真踩到过：
+    `test_role_resolution.py::test_role_auto_claims_own_server` 报
+    `assert (None is not None)`）。同一个值用过就丢掉，重取一个。
+    """
+    for _ in range(64):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = int(sock.getsockname()[1])
+        if port not in _ISSUED_PORTS:
+            _ISSUED_PORTS.add(port)
+            return port
+    raise RuntimeError('连续 64 次都拿到已经发过的端口号，端口分配可能出了问题')
 
 
 def wait_until(predicate, timeout: float = 15.0, interval: float = 0.1) -> bool:
