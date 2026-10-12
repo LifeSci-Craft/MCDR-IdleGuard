@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -33,8 +34,8 @@ from mcdreforged.api.types import PluginServerInterface
 
 from . import i18n
 from . import velocity as velocity_module
-from .bus import Bus
-from .config import Config, ServerEntry
+from .bus import Bus, parse_address
+from .config import FAKE_SERVER_BIND, LEGACY_BUS_TOKEN, Config, ServerEntry
 from .fakeserver import FakeServer
 from .mcproto import PingResult, bind_error, port_open, status_ping
 from .remote import RemoteMixin
@@ -84,6 +85,12 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         self._owner_name: Dict[str, str] = {}
         #: 对端实例的健康度：总线地址 -> {ok, at, instance, error}
         self._peer_health: Dict[str, dict] = {}
+        #: 对端快照缓存：{总线地址: {at, instance, servers, fresh_probe}}。
+        #: 心跳（`_poll_peers`）本来就每 `state_tick` 秒问一次对端状态，这里把应答里的快照留下，
+        #: 于是 `!!ig status/diag/check` 渲染时**不必再在 MCDR 的命令线程上**发起一次网络往返
+        #: （对端被防火墙丢包时，那种同步等待能把命令线程卡到十几秒）。
+        #: 只在轮询线程里写、命令线程里读；每次整体替换一个 dict，靠 GIL 就够，不必再加锁。
+        self._peer_snapshots: Dict[str, dict] = {}
         self._self_name: Optional[str] = None
         #: 为什么认定"本实例负责这台服"（给 !!ig diag 展示，省得管理员猜）
         self._claim_reason: str = ''
@@ -169,6 +176,110 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         """本实例监听的总线地址（没配置时为 None）。"""
         return self._bus_bind
 
+    def bus_bind_state(self) -> Tuple[str, str]:
+        """总线为什么没起来（给诊断页 / 自检用）：(状态, 细节)。
+
+        - `'ok'`：起来了（`bus_bind` 有值）；
+        - `'auto_no_bus'`：`bus.bind` 是 auto（或没填 / 留空，二者等价），本实例也确实负责着子服，
+          但那些条目上都没写 `bus` —— auto 的取值方式就是"照抄自己负责那条的地址"，照抄不到自然起不来。
+          细节 = 条目名；
+        - `'auto_nothing'`：同上是 auto，但本实例不负责任何子服（纯监视实例）。
+          这是**正常**的，不该当成配置错误去吓人，所以细节为空、自检也不报它；
+        - `'invalid'`：`bus.bind` 填了具体值但不是合法地址（形如 `127.0.0.1:25600`）。细节 = 原值。
+
+        光说一句"总线未配置"没法排查，这几种的处理方式完全不同。
+        """
+        if self._bus_bind:
+            return 'ok', ''
+        bind = self._config.bus.bind
+        text = bind.strip() if isinstance(bind, str) else ''
+        if text and text.lower() != 'auto':
+            return 'invalid', text
+        owned = [m for m in self._managed.values() if m.role in MANAGED_ROLES]
+        if not owned:
+            return 'auto_nothing', ''
+        missing = [m.name for m in owned if not m.entry.bus]
+        return 'auto_no_bus', '、'.join(missing or [m.name for m in owned])
+
+    def bus_token_fingerprint(self) -> str:
+        """当前总线口令的短指纹（8 位十六进制，空口令返回空串）。
+
+        给多实例对照用：口令本身不必印出来，但两边对不上时要能一眼看出是"口令不一致"
+        而不是"那台实例没运行"（这两种的表现都是连不上，很难分）。
+        """
+        token = self._config.bus.token or ''
+        return hashlib.sha256(token.encode('utf-8')).hexdigest()[:8] if token else ''
+
+    def config_warnings(self) -> List[str]:
+        """配置自检：返回一串「能一眼看懂、能直接照做」的问题说明（没问题就是空列表）。
+
+        为什么要它：有些配置问题插件**一直知道**，但只在启动时往日志里说一句，埋在两三百行里
+        根本看不见 —— 线上真踩过：`bus.bind: auto` 取不到值让整个跨实例协作失效，表现却是
+        "某个子服一直是只监视"，排查花了两轮。启动时主动报出来，就不必等用户去敲 diag。
+
+        只做**静态可判**的检查：不去连对端（那要等网络往返，不适合放在启动路径上），
+        也不猜"你想开几个 MCDR"。
+        """
+        tr = self.tr
+        out: List[str] = []
+
+        # ① 总线起不来：跨实例协作会整个失效，最要紧的一条放最前
+        state, detail = self.bus_bind_state()
+        if state == 'auto_no_bus':
+            out.append(tr('check.bus.auto_no_bus', server=detail or '?'))
+        elif state == 'invalid':
+            out.append(tr('check.bus.invalid', value=detail or '?'))
+
+        # ② 两条填了同一个总线地址：它们会互相抢端口
+        seen: Dict[str, str] = {}
+        for entry in self._config.servers:
+            if not entry.bus:
+                continue
+            first = seen.get(entry.bus)
+            if first:
+                out.append(tr('check.bus.duplicated', address=entry.bus,
+                              first=first, second=entry.name))
+            else:
+                seen[entry.bus] = entry.name
+
+        # ③ 两条子服用了同一个名字：`_managed` 以名字为键，后一条会**静默覆盖**前一条，
+        #    而状态表按配置顺序渲染会列出两行同名（管理员以为配了两台，实际只有一台受管）
+        counted: Dict[str, int] = {}
+        for entry in self._config.servers:
+            if entry.name:
+                counted[entry.name] = counted.get(entry.name, 0) + 1
+        for name, count in counted.items():
+            if count > 1:
+                out.append(tr('check.server.duplicated_name', server=name, count=count))
+
+        # ④ 配了自动休眠、却不会有任何一个实例去关它
+        for entry in self._config.servers:
+            managed = self._managed.get(entry.name)
+            role = managed.role if managed is not None else entry.role
+            if role in MANAGED_ROLES or entry.always_on or not entry.auto_sleep:
+                continue
+            if entry.role == 'watch':
+                # 明确写成只监视、却又开着自动休眠 —— 这两条自相矛盾
+                out.append(tr('check.unowned.watch', server=entry.name))
+            elif not entry.bus:
+                # role=auto 期望"端口与它一致的那台 MCDR"来管，可没人知道去哪找它
+                out.append(tr('check.unowned.no_bus', server=entry.name))
+
+        # ⑤ 口令还是历史默认值（新生成的配置已经是随机串，所以这条只对老配置有意义）
+        if (self._config.bus.token or '') == LEGACY_BUS_TOKEN:
+            out.append(tr('check.bus.default_token'))
+
+        return out
+
+    def _report_config_warnings(self) -> None:
+        """启动时把配置问题主动报出来（一次，不刷屏）。"""
+        problems = self.config_warnings()
+        if not problems:
+            return
+        self._logger.warning(f'配置自检发现 {len(problems)} 个问题（随时敲 !!ig check 重看）：')
+        for index, text in enumerate(problems, start=1):
+            self._logger.warning(f'  {index}. {text}')
+
     @property
     def claim_reason(self) -> str:
         """为什么认定"本实例负责某台服"（给诊断页展示）。"""
@@ -242,6 +353,7 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                 '没有任何子服被判定为「本实例负责」（role=self/command 都没能匹配上）。'
                 '本实例目前只会监视玩家数，不会休眠任何服务端。'
             )
+        self._report_config_warnings()
 
     def shutdown(self) -> None:
         self._stopping.set()
@@ -256,16 +368,44 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         self._bus.stop()
 
     def _resolve_bus_bind(self) -> Optional[str]:
-        """解析 bus.bind：填 "auto" 时取「本实例负责的子服条目」上写的总线地址，
-        这样同一份配置可以直接复制到每个实例，不需要为每台机器改一个端口。"""
+        """解析 bus.bind：默认的 `"auto"` 会照抄「本实例负责的那条子服」上写的总线地址，
+        这样同一份配置可以直接复制到每个实例，不需要为每台机器改一个端口。
+
+        解析不出来时按情形分级别记日志 —— 别把"这台实例本来就用不上总线"也当成配置错误来吓人。
+
+        `null` / `""` 与 `"auto"` 等价（都表示"没设置，走自动规则"）：以前这个字段默认就是空的，
+        让旧配置升级后自动获得正确行为，比让用户先读懂"auto"这个约定再手改要靠谱。
+        """
         bind = self._config.bus.bind
-        if not (isinstance(bind, str) and bind.strip().lower() == 'auto'):
-            return bind
-        for managed in self._managed.values():
-            if managed.role == 'self' and managed.entry.bus:
+        text = bind.strip() if isinstance(bind, str) else ''
+        if text and text.lower() != 'auto':
+            # 显式填了地址：用它，但先校验一下格式 —— 不然要等到 Bus.start() 才报错，
+            # 而那条错误藏在启动日志里，用户只会看到"跨实例不工作"
+            if parse_address(text) is None:
+                self._logger.warning(f'bus.bind 的值 {bind!r} 不是有效地址（应形如 127.0.0.1:25600，'
+                                     f'或留空 / 写 auto 让它自动取）—— 本次不启动总线')
+                return None
+            return text
+
+        # 优先 role=self（MCDR 自己管的服务端），其次本实例负责的任意一条
+        # （例如全靠 role=command 的一台实例 —— 那种情况没有 self 条目，但也该有地址）
+        for need_self in (True, False):
+            for managed in self._managed.values():
+                if managed.role not in MANAGED_ROLES or not managed.entry.bus:
+                    continue
+                if need_self and managed.role != 'self':
+                    continue
                 self._logger.info(f'bus.bind 为 auto，按本实例负责的 {managed.name} 取其总线地址 {managed.entry.bus}')
                 return managed.entry.bus
-        self._logger.warning('bus.bind 为 auto，但没找到「本实例负责」的子服条目（或该条目未填 bus），总线不会启动')
+
+        owned = [m for m in self._managed.values() if m.role in MANAGED_ROLES]
+        if not owned:
+            self._logger.info('bus.bind 未填（按 auto 处理），本实例也没有负责任何子服 —— 不启动总线'
+                              '（只做监视）。若希望参与跨实例协作，请在「负责它的那条」servers[] 上填 bus')
+        else:
+            names = '、'.join(m.name for m in owned)
+            self._logger.warning(f'bus.bind 未填（按 auto 处理），但本实例负责的 {names} 那格也没写 bus —— '
+                                 f'总线不会启动：跨实例通知与远程启停都用不了（补上那一格的地址即可）')
         return None
 
     # ================================================================== 配置解析
@@ -348,6 +488,12 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                 if entry.role == 'command' and not entry.start_command:
                     self._logger.warning(f'服务器 {entry.name} 是 role=command 但没写 start_command，只能监视')
                     role = 'watch'
+                if entry.name in self._managed:
+                    # 同一个名字出现两次：_managed 以名字为键，后一条会**静默覆盖**前一条，
+                    # 而状态表按配置顺序渲染会列出两行同名、指向同一份数据 ——
+                    # 管理员以为自己配了两台，实际只有一台受管（`!!ig check` 也会报这一条）。
+                    self._logger.warning(f'servers[] 里有两条都叫 {entry.name}，后一条会覆盖前一条，'
+                                         f'请把名字改成互不相同')
                 self._managed[entry.name] = ManagedServer(entry, role)
                 managed = self._managed[entry.name]
                 if managed.entry.idle_timeout is None:
@@ -441,14 +587,22 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         interval = max(0.2, tick) if tick > 0 else self._config.check_interval
         next_full = 0.0                      # 立刻先做一次完整侦察
         while not self._stopping.is_set():
+            full = time.monotonic() >= next_full
             try:
-                if time.monotonic() >= next_full:
+                if full:
                     self.poll_once()
-                    next_full = time.monotonic() + self._config.check_interval
                 else:
                     self._tick_states()
             except Exception as exc:  # noqa: BLE001 - 轮询线程必须活着
                 self._logger.error(f'轮询时出现异常：{type(exc).__name__}: {exc}', exc_info=True)
+                if full:
+                    # ⚠️ 失败时也要推进 next_full，否则它永远停在过去 —— 每一轮（默认 5 秒）
+                    # 都会重试同一个失败并打一条带堆栈的错误日志，把真正的问题淹掉。
+                    # 按整轮侦察的间隔退避，给它更多冷却时间。
+                    next_full = time.monotonic() + self._config.check_interval
+            else:
+                if full:
+                    next_full = time.monotonic() + self._config.check_interval
             if self._stopping.wait(interval):
                 return
 
@@ -695,7 +849,6 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                  f'{managed.name}: {old.value} -> {state.value}' + (f'（{detail}）' if detail else '')))
             if state != State.RUNNING:
                 managed.empty_since = None
-                managed.warned = False
 
     # ================================================================== 空闲判定
 
@@ -732,7 +885,6 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         now = time.monotonic()
         if managed.state != State.RUNNING:
             managed.empty_since = None
-            managed.warned = False
             return
 
         players, note = self._effective_players(managed)
@@ -745,12 +897,10 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             if managed.empty_since is not None:
                 self._logger.info(f'{managed.name}: 有玩家进入，空闲计时清零')
             managed.empty_since = None
-            managed.warned = False
             return
 
         if managed.empty_since is None:
             managed.empty_since = now
-            managed.warned = False
             self._logger.info(f'{managed.name}: 已无玩家，开始空闲计时（阈值 {int(managed.idle_timeout)} 秒）')
             return
 
@@ -759,7 +909,6 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                          and managed.entry.auto_sleep and not managed.locked
                          and not managed.entry.always_on)
         if not sleep_allowed:
-            managed.warned = False
             return                      # 只计时，不管服（浮窗里仍然能看到空闲多久）
 
         if managed.busy_until > now:
@@ -771,19 +920,10 @@ class Supervisor(TakeoverMixin, RemoteMixin):
 
         idle = now - managed.empty_since
         if idle < timeout:
-            warn = self._config.announce.warn_before_sleep
-            if warn > 0 and not managed.warned and (timeout - idle) <= warn:
-                managed.warned = True
-                self._announce(self.tr(
-                    'announce.closing_soon',
-                    server=managed.name, seconds=int(timeout - idle), minutes=int(idle // 60),
-                ))
-            return
+            return                      # 还没到点，继续计时
 
-        # 保护期检查
+        # 保护期检查：服务端就绪后这段时间内不判定空闲（被唤醒的场景同样由它保护）
         if managed.started_at is not None and now - managed.started_at < self._config.min_uptime:
-            return
-        if now - managed.last_wake_ts < self._config.grace_after_wake:
             return
 
         self._logger.info(f'{managed.name}: 连续 {int(idle)} 秒无人，执行自动休眠（{note}）')
@@ -1107,7 +1247,7 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                 return
 
             # 3) 等待就绪
-            timeout = managed.entry.startup_timeout or self._config.startup_timeout
+            timeout = self._config.startup_timeout
             if not self._wait_ready(managed, timeout):
                 if self._stopping.is_set():
                     return
@@ -1122,7 +1262,6 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             managed.started_at = time.monotonic()
             managed.last_stopped_at = None
             managed.empty_since = None
-            managed.warned = False
             self._set_state(managed, State.RUNNING, '')
             slept = self._stats.note_wake(name)
             self._logger.info(f'{name} 已就绪，本次启动耗时 {elapsed:.1f} 秒'
@@ -1166,7 +1305,7 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             time.sleep(0.5)
         self._logger.warning(
             f'{managed.name}: 端口 {host}:{port} 上一直有监听者，放弃本轮唤醒'
-            f'（本机 bind 探测结果：{bind_error(self._config.fake_server.bind, port)}）'
+            f'（本机 bind 探测结果：{bind_error(FAKE_SERVER_BIND, port)}）'
         )
         return False
 
@@ -1321,8 +1460,17 @@ class Supervisor(TakeoverMixin, RemoteMixin):
     # ================================================================== 通知
 
     def _peer_addresses(self) -> List[str]:
-        own = self._bus_bind
-        return [e.bus for e in self._config.servers if e.bus and e.bus != own]
+        """要联系的对端实例地址：`servers[]` 里填了 bus、且**不是本实例自己那座**的那些。
+
+        ⚠️ 必须连「本实例负责的条目」一起排除，不能只按地址比：`bus.bind` 没解析出来时
+        `own` 是空的，只比地址就会把**自己**当成对端去连 —— 症状是 diag 里多出一条永远
+        连不上的对端，让人误以为"那台实例挂了"（线上真踩到过）。
+        """
+        own = {self._bus_bind} if self._bus_bind else set()
+        own_names = {name for name, managed in self._managed.items()
+                     if managed.role in MANAGED_ROLES}
+        return [entry.bus for entry in self._config.servers
+                if entry.bus and entry.bus not in own and entry.name not in own_names]
 
     def _announce(self, text: str) -> None:
         if not self._config.announce.enabled or not text:
@@ -1454,12 +1602,15 @@ class Supervisor(TakeoverMixin, RemoteMixin):
           —— 因为本地那份快照是上一轮侦察（默认 10 分钟前）拍的。
         - 对方没应答（实例不在线）时才退回本地旧快照，且**不算**可信数据，
           这样命令层就不会拿陈旧状态去拒绝一个其实该执行的操作。
+
+        数据来源优先是**心跳缓存**（`_collect_peer_snapshots`）：心跳每 `state_tick` 秒在后台
+        问过对端并留下了快照，所以这里通常不必再等网络。只有"完全没缓存"的地址才会现场问一次。
         """
         merged: Dict[str, ServerView] = {v.name: v for v in self.local_views()}
         live: Set[str] = {name for name, view in merged.items() if view.role in MANAGED_ROLES}
-        for reply in self._bus.broadcast(self._peer_addresses(), {'type': 'state'}, timeout=2.0):
-            instance = str(reply.get('instance') or '')
-            for data in reply.get('servers') or []:
+        for snapshot in self._collect_peer_snapshots():
+            instance = snapshot['instance']
+            for data in snapshot['servers']:
                 if not isinstance(data, dict):
                     continue
                 view = ServerView.from_dict(data, instance=instance)
@@ -1471,7 +1622,10 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                     live.add(view.name)
                     if instance:
                         self._owner_name[view.name] = instance
-                        self._mark_peer_alive(instance)
+                        # 只有"刚刚真的通过话"才算心跳：缓存里的旧快照不刷新对端健康度，
+                        # 否则一个刚挂掉的实例会被它 5 秒前的数据"续命"（健康度由心跳自己维护）
+                        if snapshot.get('fresh_probe'):
+                            self._mark_peer_alive(instance)
                 elif target is None:
                     merged[view.name] = view
                 elif not target.instance and view.instance:
@@ -1520,6 +1674,9 @@ class Supervisor(TakeoverMixin, RemoteMixin):
 
         状态表要能区分「没人管」与「管它的实例掉线了」，就得有个持续的健康检查；
         顺便把失败原因（`Bus.last_error`）记下来，`!!ig diag` 直接展示。
+
+        另外顺手把应答里的**对端快照**缓存下来：读命令（`!!ig status` 等）要用的就是它，
+        以前它们会在命令线程上再问一遍（每个对端最多同步等 2 秒）。
         """
         for address in self._peer_addresses():
             entry = self._peer_health.setdefault(address, {})
@@ -1529,10 +1686,75 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                     ok=True, at=time.monotonic(), error='',
                     instance=str(reply.get('instance') or entry.get('instance', '')),
                 )
+                self._remember_peer_snapshot(address, reply)
             else:
                 read_error = getattr(self._bus, 'last_error', None)
                 reason = read_error(address) if callable(read_error) else ''
                 entry.update(ok=False, at=time.monotonic(), error=reason or '对端没有应答')
+                # 记一个"刚问过、但它不在线"的标记（servers 为空）：这样读命令知道
+                # "这个地址没有可用数据"，不必再同步去问一次 —— 它会退回本地旧快照，
+                # 并把那些行标成**不可信**（与以前"对端没应答"时的行为一致）。
+                self._peer_snapshots[address] = {
+                    'at': time.monotonic(), 'instance': str(entry.get('instance') or ''),
+                    'servers': [], 'fresh_probe': False,
+                }
+
+    # ------------------------------------------------------------------ 对端快照
+    @staticmethod
+    def _snapshot_from_reply(reply) -> Optional[dict]:
+        """把对端 `state` 应答整理成一份快照；不可用时返回 None。"""
+        if not isinstance(reply, dict) or not reply.get('ok'):
+            return None
+        servers = reply.get('servers')
+        if not isinstance(servers, list):
+            return None
+        return {'at': time.monotonic(), 'instance': str(reply.get('instance') or ''),
+                'servers': servers, 'fresh_probe': True}
+
+    def _remember_peer_snapshot(self, address: str, reply) -> None:
+        """缓存心跳拿到的对端快照（`fresh_probe=False`：它不是"刚刚才通过话"）。"""
+        snapshot = self._snapshot_from_reply(reply)
+        if snapshot is not None:
+            snapshot['fresh_probe'] = False
+            self._peer_snapshots[address] = snapshot
+
+    def _snapshot_ttl(self) -> float:
+        """缓存被认为"还新鲜"的时长（秒）：心跳间隔的几倍，够兜住偶发的一两次失败。
+
+        ⚠️ 上界 60 秒是刻意的：心跳间隔可以配得很大（甚至被关掉），但"实时状态"不该
+        拿一分钟前的东西顶上 —— 超过就当没有缓存，退回现场探测。下界 15 秒则保证
+        心跳正常（默认 5 秒）时不会因为偶尔一次失败就退化回同步等待。
+        """
+        tick = self._config.state_tick
+        return min(60.0, max(15.0, 3.0 * tick)) if tick > 0 else 15.0
+
+    def _collect_peer_snapshots(self) -> List[dict]:
+        """取对端快照：**优先用心跳缓存**，只为"完全没缓存"的地址现场问一次。
+
+        为什么这么绕：心跳每 `state_tick` 秒已经在后台问过对端同一句 `{'type': 'state'}`，
+        并把完整快照拿回来了（以前直接丢掉）。读命令再用它就不必同步等网络 ——
+        否则对端不可达时（连接被防火墙丢包而不是干脆拒绝），每台要等满 2 秒，
+        命令线程会被卡到 MCDR 报「TaskExecutor 线程已经 10 秒没有响应了」。
+        """
+        now = time.monotonic()
+        ttl = self._snapshot_ttl()
+        ready: List[dict] = []
+        missing: List[str] = []
+        for address in self._peer_addresses():
+            snapshot = self._peer_snapshots.get(address)
+            if snapshot is not None and now - snapshot['at'] <= ttl:
+                ready.append(snapshot)
+            else:
+                missing.append(address)
+        if not missing:
+            return ready
+        # 只对"完全没缓存"的地址现场问一次（例如插件刚起来、心跳还没跑第一轮，
+        # 或者把 state_tick 关掉了）—— 有缓存就绝不在读路径上同步等待。
+        for reply in self._bus.broadcast(missing, {'type': 'state'}, timeout=2.0):
+            snapshot = self._snapshot_from_reply(reply)
+            if snapshot is not None:
+                ready.append(snapshot)
+        return ready
 
     # ================================================================== 事件入口
 

@@ -51,18 +51,31 @@ def _identity(sup: Supervisor) -> List[Row]:
 def _bus(sup: Supervisor) -> List[Row]:
     tr = sup.tr
     out: List[Row] = []
-    if sup.bus_bind:
+    state, detail = sup.bus_bind_state()
+    if state == 'ok':
         out.append((tr('diag.bus.listen', address=sup.bus_bind), RColor.gray))
+    elif state == 'auto_no_bus':
+        out.append((tr('diag.bus.none.auto', server=detail or '?'), RColor.yellow))
+    elif state == 'auto_nothing':
+        # 不负责任何子服的实例不启动总线属于正常，用灰色而不是黄色（别把"用不上"说成"出错了"）
+        out.append((tr('diag.bus.none.watch'), RColor.gray))
     else:
-        out.append((tr('diag.bus.none'), RColor.yellow))
+        out.append((tr('diag.bus.invalid', value=detail or '?'), RColor.yellow))
 
+    out.extend(_peer_rows(sup))
+    return out
+
+
+def _peer_rows(sup: Supervisor, *, when_empty: str = 'diag.peer.none') -> List[Row]:
+    """对端健康度（**最近一次探测的结果**，不主动探测 —— 那是心跳的活儿）。"""
+    tr = sup.tr
     health: Dict[str, dict] = sup.peer_health()
     if not health:
-        out.append((tr('diag.peer.none'), RColor.gray))
-        return out
+        return [(tr(when_empty), RColor.gray)]
     now = time.monotonic()
+    out: List[Row] = []
     for address, info in sorted(health.items()):
-        instance = str(info.get('instance') or '?')
+        instance = str(info.get('instance') or '') or tr('diag.peer.unknown_instance')
         if info.get('ok'):
             age = max(0, int(now - float(info.get('at') or now)))
             out.append((tr('diag.peer.ok', address=address, instance=instance, seconds=age),
@@ -70,6 +83,31 @@ def _bus(sup: Supervisor) -> List[Row]:
         else:
             out.append((tr('diag.peer.fail', address=address, instance=instance,
                            error=str(info.get('error') or '?')), RColor.red))
+    return out
+
+
+def check_rows(supervisor: Supervisor) -> List[Row]:
+    """`!!ig check` 的内容：配置自检结果 + 对端最近一次探测。
+
+    和 `!!ig diag` 的区别：diag 是"现在是什么状态"，check 是"**配置**有没有毛病" ——
+    后者不看运行时状态，所以它给的每一条都是能直接照做的。
+    """
+    tr = supervisor.tr
+    problems = supervisor.config_warnings()
+    out: List[Row] = []
+    if problems:
+        out.append((tr('check.header', count=len(problems)), RColor.yellow))
+        out.extend((f'  {index}. {text}', RColor.yellow)
+                   for index, text in enumerate(problems, start=1))
+        out.append((tr('check.hint'), RColor.gray))
+    else:
+        out.append((tr('check.all_ok'), RColor.green))
+    # 口令指纹：两边连不上时，"口令不一致"和"那台实例没运行"表现一样，给个能对照的东西
+    password_fingerprint = supervisor.bus_token_fingerprint()
+    if password_fingerprint:
+        out.append((tr('check.bus.token', fingerprint=password_fingerprint), RColor.gray))
+    out.append((tr('check.peer.header'), RColor.white))
+    out.extend(_peer_rows(supervisor, when_empty='check.peer.none'))
     return out
 
 
@@ -100,6 +138,9 @@ def _server_reason(sup: Supervisor, view) -> str:
         return tr('diag.server.reason.offline', instance=view.instance)
     if view.instance:
         return tr('diag.server.reason.remote', instance=view.instance)
+    if getattr(view, 'auto_sleep', True):
+        # 配着自动休眠却没人负责它 —— 这条配置永远生效不了，必须点出来
+        return tr('diag.server.reason.watch_unowned')
     return tr('diag.server.reason.watch')
 
 

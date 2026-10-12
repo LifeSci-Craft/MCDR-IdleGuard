@@ -46,7 +46,6 @@ def build(*, auto_sleep: bool = True, state_tick: float = 0.4):
         state_tick=state_tick,
         idle_timeout=9999.0,
         min_uptime=0.0,
-        grace_after_wake=0.0,
         startup_timeout=5.0,
         stop_timeout=3.0,
         port_release_timeout=3.0,
@@ -249,7 +248,6 @@ def test_mcdr_is_kept_alive_when_the_server_dies(pinger):
         calls = []
         stub.set_exit_after_stop_flag = calls.append      # MCDR 的公开 API
         supervisor.config.fake_server.enabled = True      # 插件确实要接管端口
-        supervisor.config.fake_server.bind = '127.0.0.1'
         supervisor.state_of('Survival').entry.auto_wake = True
         supervisor.start()
         assert wait_until(lambda: supervisor.state_of('Survival').state == State.RUNNING, 10)

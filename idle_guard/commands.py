@@ -76,6 +76,7 @@ _HELP_ROWS = (
     ('status', True),
     ('diag', True),
     ('stats', True),
+    ('check', True),
     ('wake', False),
     ('sleep', False),
     ('confirm', True),
@@ -470,6 +471,13 @@ def _cmd_stats(source: CommandSource, supervisor: Supervisor) -> None:
     _screen(source, supervisor, body, tr('command.screen.stats_hint'))
 
 
+def _cmd_check(source: CommandSource, supervisor: Supervisor) -> None:
+    """配置自检：把"启动时只在日志里说一次"的配置问题随时摊开看。"""
+    tr = supervisor.tr
+    body = [RText(text, colour) for text, colour in diag.check_rows(supervisor)]
+    _screen(source, supervisor, body, tr('command.screen.check_hint'))
+
+
 def _cmd_status(source: CommandSource, supervisor: Supervisor, prefix: str = '!!ig') -> None:
     """列出**全部**子服状态（不带子服参数：想看哪台看表格里对应的那一行）。"""
     tr = supervisor.tr
@@ -718,6 +726,10 @@ def build_tree(supervisor: Supervisor, prefix: str) -> Literal:
     root.then(
         Literal('stats').requires(admin(PERM_STATUS))
         .runs(lambda src, ctx, _sup=supervisor: _cmd_stats(src, _sup))
+    )
+    root.then(
+        Literal('check').requires(admin(PERM_STATUS))
+        .runs(lambda src, ctx, _sup=supervisor: _cmd_check(src, _sup))
     )
     for action in ('wake', 'sleep', 'lock', 'unlock'):
         root.then(

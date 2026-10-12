@@ -39,6 +39,13 @@ from .mcproto import (
 )
 
 
+#: 同时处理的连接数上限。这是对外的游戏端口，所以给个硬上限：
+#: 每条连接占一个线程（读超时 5 秒 + 等对端关闭 2 秒），不限个数就有可能被打满线程与句柄；
+#: 句柄一满还会连带把接受循环打挂（EMFILE）。正常玩家与实例间探测远到不了这个数，
+#: 所以它只在被扫时才起作用。不做成配置项：它没有需要按机器区分的场景。
+MAX_CONNECTIONS = 64
+
+
 class FakeServer:
     def __init__(
         self,
@@ -50,6 +57,7 @@ class FakeServer:
         logger,
         read_timeout: float = 5.0,
         linger_timeout: float = 2.0,
+        max_connections: int = MAX_CONNECTIONS,
     ):
         self._bind_host = bind_host
         self._port = int(port)
@@ -59,6 +67,9 @@ class FakeServer:
         self._logger = logger
         self._read_timeout = read_timeout
         self._linger_timeout = linger_timeout
+        self._max_connections = max(1, int(max_connections))
+        #: 当前正在处理的连接数（受 _max_connections 限制）
+        self._active = 0
 
         self._lock = threading.RLock()
         self._sock: Optional[socket.socket] = None
@@ -81,6 +92,12 @@ class FakeServer:
     @property
     def last_error(self) -> str:
         return self._last_error
+
+    @property
+    def active_connections(self) -> int:
+        """当前正在处理的连接数（诊断用；上限见 MAX_CONNECTIONS）。"""
+        with self._lock:
+            return self._active
 
     def start(self, force: bool = False) -> bool:
         """尝试绑定端口并开始监听。端口不可用（说明真实服务端还在跑）时返回 False。
@@ -143,14 +160,51 @@ class FakeServer:
                     return
             try:
                 conn, addr = sock.accept()
-            except OSError:
-                return
+            except OSError as exc:
+                if not self.running:
+                    return              # stop() 关掉了监听的 socket：正常退出
+                # ⚠️ 意外错误**不能**让接受线程退出：socket 还留在 LISTEN、`running` 仍是 True，
+                # 但再也没人去 accept —— 玩家连接收不到任何回复、也触发不了唤醒，而日志里
+                # 一句提示都没有（实测复现过：一次 EMFILE 之后就永久失效）。总线那处同样的坑
+                # 此前已修（见 bus._accept_loop 的注释）。这里记一条日志、歇一下继续转。
+                self._last_error = f'{type(exc).__name__}: {exc}'
+                self._logger.warning(f'假服务端接受连接出错（{self._last_error}），1 秒后继续')
+                time.sleep(1.0)
+                continue
+
+            with self._lock:
+                room = self._active < self._max_connections
+                if room:
+                    self._active += 1
+            if not room:
+                # 并发上限：这是**对外的游戏端口**，不限个数的话几百个"连上不发数据"的连接
+                # 就能把线程与句柄堆满；句柄一满还会把上面的 accept 打挂（EMFILE）。
+                self._logger.debug(f'假服务端并发连接已达上限 {self._max_connections}，'
+                                   f'丢弃来自 {addr[0]} 的连接')
+                self._close_quietly(conn)
+                continue
+
             threading.Thread(
-                target=self._handle,
+                target=self._serve_connection,
                 args=(conn, f'{addr[0]}:{addr[1]}'),
                 name=f'IdleGuard-FakeConn-{self._port}',
                 daemon=True,
             ).start()
+
+    def _serve_connection(self, conn: socket.socket, peer: str) -> None:
+        """跑完一条连接，并把并发计数还回去（计数在 `_accept_loop` 里加）。"""
+        try:
+            self._handle(conn, peer)
+        finally:
+            with self._lock:
+                self._active = max(0, self._active - 1)
+
+    @staticmethod
+    def _close_quietly(conn: socket.socket) -> None:
+        try:
+            conn.close()
+        except OSError:
+            pass
 
     def _handle(self, conn: socket.socket, peer: str) -> None:
         try:
@@ -178,10 +232,7 @@ class FakeServer:
         except Exception as exc:  # noqa: BLE001 - 假服务端不能因为单个连接异常而崩溃
             self._logger.debug(f'假服务端处理 {peer} 的连接时出错: {type(exc).__name__}: {exc}')
         finally:
-            try:
-                conn.close()
-            except OSError:
-                pass
+            self._close_quietly(conn)
 
     def _handle_status(self, conn: socket.socket, reader: ConnReader, protocol: int = -1) -> None:
         packet_id, _ = reader.read_packet()

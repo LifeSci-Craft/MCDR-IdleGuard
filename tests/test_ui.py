@@ -57,7 +57,7 @@ def supervisor():
         check_interval=600.0,
         idle_timeout=3600.0,
         bus=BusConfig(bind=None),
-        fake_server=FakeServerConfig(enabled=False, bind='127.0.0.1'),
+        fake_server=FakeServerConfig(enabled=False),
         announce=AnnounceConfig(enabled=False),
         servers=[ServerEntry(name='survival', host='127.0.0.1', port=free_port(), role='self'),
                  ServerEntry(name='creative', host='127.0.0.1', port=free_port(), role='watch')],

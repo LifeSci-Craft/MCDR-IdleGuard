@@ -73,9 +73,28 @@
 某个玩家，都靠各实例互相传话。远程操作只发给**对端**（排除自己），否则本实例会先回一句
 "本实例不负责 X"把真结果盖掉。
 
+**配置文件按功能分组（只在文件层面）。** `config.py` 里的字段一律平铺（代码与测试直接读属性），
+写进 `config.json` 时由 `CONFIG_LAYOUT` + `Config.serialize()` 归成 `sleep` / `startup` / `announce` /
+`fake_server` / `bus` / `servers` 几段，读回来时 `Config.deserialize()` 先摊平。这么做有两个好处：
+老配置（平铺写法）**照原样能读**（不必写迁移、不会丢值），而且加字段时不用改 300 个测试。
+`announce` 是"真子对象 + 布局组"重叠的那一个（多塞了 `player_attempt_window`），两个方向都要保留
+它自己的字段（`tests/test_config_defaults.py` 有专门的用例盯着）。
+
+**四个被删掉的字段（别加回来）**：`grace_after_wake`（并进 `min_uptime`）、`servers[].startup_timeout`
+（只留全局）、`fake_server.bind`（固定 `0.0.0.0`）、`announce.warn_before_sleep`（功能一并删除）。
+理由都是"多一行就多一个要判断要不要改的地方"，而它们要么有更强替代、要么几乎没人改。
+
 **配置由各实例共享。** `role: auto` 通过 MCDR 工作目录下 `server.properties` 的 `server-port`
-自动认出"我是谁"，`bus.bind: "auto"` 取该条目的 `bus` 地址作为自己的监听地址，于是同一份配置可以
-原封不动复制到每个子服。
+自动认出"我是谁"，`bus.bind`（默认 `"auto"`，留空等价）取该条目的 `bus` 地址作为自己的监听地址，
+于是同一份配置可以原封不动复制到每个子服。地址因此**只写在 `servers[].bus` 一处**：
+`servers[].bus` 回答"负责这台子服的那台实例在哪"，`bus.bind` 回答"我自己在哪听"。
+
+两个默认值是踩过坑才改的，别改回去：
+
+- `bus.bind` 默认曾是空的 → 新生成的配置**必然**总线不启动，用户得先读懂 `auto` 这个约定才可能填对
+  （症状是"某个子服一直只监视"，线上查了两轮）。现在留空按 `auto` 处理，老配置升级即自动具备该行为。
+- `bus.token` 默认曾是一个写死的公开口令 → 跨机器部署等于没有防线。现在首次生成配置时由
+  `new_bus_token()` 现生成随机串；`LEGACY_BUS_TOKEN` 只留给自检识别老配置。
 
 **启动完成判定用多信号。** MCDR 的 `is_server_startup()` 在 Paper 上实测返回 False，
 所以判定 = MCDR 标志 或 状态查询可用 或（进程活着且端口能接受 TCP 连接）。
