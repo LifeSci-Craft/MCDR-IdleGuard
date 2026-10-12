@@ -23,7 +23,7 @@ def build(tmp_path, monkeypatch, own_role: str):
         check_interval=9999.0,
         idle_timeout=9999.0,
         bus=BusConfig(bind=None),
-        fake_server=FakeServerConfig(enabled=False, bind='127.0.0.1'),
+        fake_server=FakeServerConfig(enabled=False),
         announce=AnnounceConfig(enabled=False),
         servers=[
             ServerEntry(name='Survival', host='127.0.0.1', port=own_port, role=own_role, auto_sleep=False),
