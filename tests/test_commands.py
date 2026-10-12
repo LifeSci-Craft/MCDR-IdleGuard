@@ -69,12 +69,11 @@ def supervisor():
         check_interval=60.0,
         idle_timeout=9999.0,
         min_uptime=0.0,
-        grace_after_wake=0.0,
         startup_timeout=2.0,
         stop_timeout=2.0,
         port_release_timeout=2.0,
         bus=BusConfig(bind=None),
-        fake_server=FakeServerConfig(enabled=False, bind='127.0.0.1'),
+        fake_server=FakeServerConfig(enabled=False),
         announce=AnnounceConfig(enabled=False),
         servers=[ServerEntry(name='survival', host='127.0.0.1', port=free_port(), role='self')],
     )

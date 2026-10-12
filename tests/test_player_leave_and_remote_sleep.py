@@ -55,7 +55,6 @@ def build(*, idle_timeout: float = 9999.0):
         state_tick=0.0,                 # 测试自己驱动，不要后台线程
         idle_timeout=idle_timeout,
         min_uptime=0.0,
-        grace_after_wake=0.0,
         startup_timeout=5.0,
         stop_timeout=3.0,
         port_release_timeout=3.0,

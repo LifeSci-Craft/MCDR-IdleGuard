@@ -80,7 +80,6 @@ class ManagedServer:
         self.detail = ''
 
         self.empty_since: Optional[float] = None
-        self.warned = False
         self.locked = False
         self.wake_failures = 0
         self.last_wake_ts = 0.0

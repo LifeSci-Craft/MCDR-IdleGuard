@@ -32,7 +32,6 @@ def command_env(tmp_path):
         check_interval=0.5,
         idle_timeout=2.0,
         min_uptime=0.3,
-        grace_after_wake=0.3,
         startup_timeout=25.0,
         stop_timeout=15.0,
         port_release_timeout=10.0,
@@ -41,7 +40,7 @@ def command_env(tmp_path):
         player_attempt_window=60.0,
         debug=True,
         bus=BusConfig(bind=None),
-        fake_server=FakeServerConfig(enabled=True, bind='127.0.0.1'),
+        fake_server=FakeServerConfig(enabled=True),
         announce=AnnounceConfig(enabled=True),
         servers=[
             ServerEntry(

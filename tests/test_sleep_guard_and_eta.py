@@ -57,10 +57,9 @@ def _make_supervisor(*, data_folder=None, servers=None, **overrides):
         check_interval=600.0,
         idle_timeout=60.0,
         min_uptime=0.0,
-        grace_after_wake=0.0,
         stop_timeout=1.0,
         bus=BusConfig(bind=None),
-        fake_server=FakeServerConfig(enabled=False, bind='127.0.0.1'),
+        fake_server=FakeServerConfig(enabled=False),
         announce=AnnounceConfig(enabled=False),
         servers=servers or [ServerEntry(name='survival', host='127.0.0.1', port=free_port(),
                                         role='self')],
@@ -130,8 +129,8 @@ def test_every_command_requires_admin(env):
                 assert requirement.requirement(player) is False, f'{node} 普通玩家能执行'
                 assert requirement.requirement(helper) is False, f'{node} helper 能执行'
                 assert requirement.requirement(admin) is True, f'{node} 管理员被挡住了'
-        assert names == {'!!ig', 'help', 'status', 'diag', 'stats', 'wake', 'sleep', 'lock',
-                         'unlock', 'confirm', 'cancel', 'poll', 'reload'}, names
+        assert names == {'!!ig', 'help', 'status', 'diag', 'stats', 'check', 'wake', 'sleep',
+                         'lock', 'unlock', 'confirm', 'cancel', 'poll', 'reload'}, names
     finally:
         instance.shutdown()
 

@@ -1,40 +1,52 @@
 {
     "instance_name": "auto",
     "language": "auto",
-    "check_interval": 600.0,
-    "idle_timeout": 3600.0,
-    "min_uptime": 300.0,
-    "grace_after_wake": 300.0,
-    "startup_timeout": 300.0,
-    "stop_timeout": 180.0,
-    "port_release_timeout": 60.0,
-    "wake_cooldown": 15.0,
-    "fallback_startup_seconds": 60.0,
-    "player_attempt_window": 600.0,
-    "ignore_players": [],
-    "max_wake_failures": 3,
     "debug": false,
-    "bus": {
-        "bind": "auto",
-        "token": "idle_guard",
-        "timeout": 3.0
+    "sleep": {
+        "idle_timeout": 3600.0,
+        "min_uptime": 300.0,
+        "check_interval": 600.0,
+        "state_tick": 5.0,
+        "wake_cooldown": 15.0,
+        "confirm_timeout": 30.0,
+        "busy_patterns": [
+            "(?i)\\bbacking up\\b",
+            "(?i)\\bbackup (?:has )?(?:started|begun|complete|completed|finished)\\b",
+            "(?i)\\b(?:creating|preparing|starting) (?:the )?(?:world |server )?backup\\b",
+            "(?i)\\bworld backup (?:started|created)\\b"
+        ],
+        "busy_hold_seconds": 300.0,
+        "ignore_players": []
     },
-    "fake_server": {
-        "enabled": true,
-        "bind": "0.0.0.0"
+    "startup": {
+        "startup_timeout": 300.0,
+        "stop_timeout": 180.0,
+        "port_release_timeout": 60.0,
+        "fallback_startup_seconds": 60.0,
+        "hot_startup_window": 300.0,
+        "max_wake_failures": 3
     },
     "announce": {
         "enabled": true,
-        "warn_before_sleep": 60.0,
         "tell_attempt_players": true,
-        "sound": "minecraft:block.note_block.pling"
+        "sound": "minecraft:block.note_block.pling",
+        "player_attempt_window": 600.0
     },
+    "fake_server": {
+        "enabled": true
+    },
+    "bus": {
+        "bind": "auto",
+        "token": "QER9CaQappuVUMKPqF5F45K8",
+        "timeout": 3.0
+    },
+    "velocity_config": "auto",
     "servers": [
         {
-            "name": "Survival",
+            "name": "lobby",
             "host": "127.0.0.1",
-            "port": 30000,
-            "role": "auto",
+            "port": 25565,
+            "role": "watch",
             "auto_sleep": false,
             "auto_wake": true,
             "always_on": false,
@@ -42,13 +54,12 @@
             "start_command": null,
             "stop_command": null,
             "working_directory": null,
-            "idle_timeout": null,
-            "startup_timeout": null
+            "idle_timeout": null
         },
         {
-            "name": "Creative",
+            "name": "survival",
             "host": "127.0.0.1",
-            "port": 30001,
+            "port": 25566,
             "role": "auto",
             "auto_sleep": true,
             "auto_wake": true,
@@ -57,11 +68,7 @@
             "start_command": null,
             "stop_command": null,
             "working_directory": null,
-            "idle_timeout": null,
-            "startup_timeout": null
+            "idle_timeout": null
         }
-    ],
-    "confirm_timeout": 30.0,
-    "velocity_config": "auto",
-    "state_tick": 5.0
+    ]
 }

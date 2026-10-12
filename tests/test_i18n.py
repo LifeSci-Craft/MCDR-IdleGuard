@@ -152,7 +152,7 @@ def build(language: str, mcdr_language: str = 'zh_cn'):
         check_interval=9999.0,
         idle_timeout=9999.0,
         bus=BusConfig(bind=None),
-        fake_server=FakeServerConfig(enabled=False, bind='127.0.0.1'),
+        fake_server=FakeServerConfig(enabled=False),
         announce=AnnounceConfig(enabled=False),
         servers=[ServerEntry(name='survival', host='127.0.0.1', port=free_port(), role='self')],
     )
@@ -209,7 +209,7 @@ def test_config_has_no_text_templates():
     assert 'language' in fields
     announce_fields = set(AnnounceConfig.get_field_annotations())
     # sound 不是文案，是原版音效 id（无语言的标识符）
-    assert announce_fields == {'enabled', 'warn_before_sleep', 'tell_attempt_players', 'sound'}
+    assert announce_fields == {'enabled', 'tell_attempt_players', 'sound'}
     fake_fields = set(FakeServerConfig.get_field_annotations())
-    assert fake_fields == {'enabled', 'bind'}
+    assert fake_fields == {'enabled'}
     assert Config().check_interval == 600.0, '默认侦察间隔应为 10 分钟'
