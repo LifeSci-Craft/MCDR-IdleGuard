@@ -23,19 +23,28 @@ from .config import Config
 from .supervisor import Supervisor
 
 PLUGIN_ID = 'idle_guard'
-PLUGIN_VERSION = '1.0.0'
+PLUGIN_VERSION = '1.1.0'
 
 _supervisor: Optional[Supervisor] = None
 
 
 def _load_config(server: PluginServerInterface) -> Config:
     """读取插件配置。配置损坏时保留原文件并报错，绝不静默重置（避免丢掉整份拓扑配置）。"""
+    path = os.path.join(server.get_data_folder(), 'config.json')
+    first_run = not os.path.isfile(path)      # MCDR 会在这之后按默认值把文件写出来
     try:
-        return server.load_config_simple('config.json', target_class=Config, failure_policy='raise')
+        config = server.load_config_simple('config.json', target_class=Config, failure_policy='raise')
     except Exception as exc:  # noqa: BLE001
         server.logger.error(f'配置文件 config/idle_guard/config.json 读取失败：{type(exc).__name__}: {exc}')
         server.logger.error('原文件已保留，不会被覆盖。请修正后执行 !!MCDR plugin reload idle_guard')
         raise
+    if first_run:
+        # bus.token 的默认值是 new_bus_token() 现生成的随机串（不再是公开的固定口令），
+        # 但它必须与其它实例一致 —— 所以这里把值印出来，并说明该复制到哪儿去。
+        server.logger.info(f'已生成新配置，总线口令 bus.token = {config.bus.token}')
+        server.logger.info('若你还有别的 MCDR 实例：请把这串口令填到它们 config.json 的同一字段'
+                          '（对不上会报「鉴权失败」）；只有这一个实例则可以不管')
+    return config
 
 
 def on_load(server: PluginServerInterface, prev_module) -> None:
