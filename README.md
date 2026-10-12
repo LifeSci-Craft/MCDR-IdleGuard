@@ -52,7 +52,7 @@
 控制台里的状态表：
 
 ```
-================= Idle Guard v1.0.0 ==================
+================= Idle Guard v1.1.0 ==================
 #  子服      角色      状态    人数  备注       开关
 1  Survival  本实例    运行中  1/20  @Survival  [休眠]
 2  Creative  对方实例  已休眠  0     @Creative  [开启]
@@ -63,7 +63,7 @@
 
 ## 安装
 
-1. 把 `idle_guard-1.0.0.mcdr` 放进**每个子服的 MCDR** 的 `plugins/` 目录（推荐每个子服一个实例）；
+1. 把 `idle_guard-1.1.0.mcdr` 放进**每个子服的 MCDR** 的 `plugins/` 目录（推荐每个子服一个实例）；
 2. 执行 `!!MCDR plugin reload idle_guard`，或重启 MCDR；
 3. 首次启动会生成 `config/idle_guard/config.json`。**先按自己的拓扑改 `servers` 再让它跑**；
 4. 执行 `!!ig status` 看各子服状态。
@@ -87,6 +87,7 @@
 | `!!ig wake <编号 / 子服名>` | 唤醒，可跨实例下发 |
 | `!!ig lock` / `!!ig unlock <编号 / 子服名>` | 暂停 / 恢复这台子服上的自动休眠与自动唤醒 |
 | `!!ig diag` | 诊断页：认领依据 / 总线与对端健康度 / 休眠预检逐条结论 / ETA 样本 / 最近事件 |
+| `!!ig check` | 配置自检：总线起没起、地址有没有撞车、有没有子服配了自动休眠却没人管 |
 | `!!ig stats` | 休眠统计：次数、累计休眠时长、唤醒次数 |
 | `!!ig poll` | 立刻侦察一轮 |
 | `!!ig reload` | 重载插件与配置 |
@@ -112,89 +113,165 @@ survival 已休眠
 ## 配置
 
 配置文件：`config/idle_guard/config.json`。升级后新增的选项会自动按默认值补齐。
-下面每张表的选项名就是文件中的完整路径。
+**绝大多数情况你只需要改 `servers[]` 和 `bus.token` 两处**，其余保持默认即可。
+
+文件按功能分成几段：`sleep`（什么时候休眠）/ `startup`（起停要等多久）/ `announce`（通知）/
+`fake_server`（休眠期间的假服务端）/ `bus`（实例间通信）/ `servers`（子服清单）。
+分组只影响**文件长相**：老版本那份平铺写法照样能读，不用手改。
 
 ```jsonc
 {
-  "language": "auto",                          // 跟随 MCDR；也可写 zh_cn / en_us
-  "check_interval": 600,                       // 侦察间隔（秒）
-  "state_tick": 5,                             // 状态心跳（秒）
-  "idle_timeout": 3600,                        // 连续无人多久后休眠（秒）
-  "velocity_config": "auto",                   // 从 velocity.toml 自动补子服清单；"off" = 关闭
-  "servers": [
-    { "name": "lobby",    "host": "127.0.0.1", "port": 25565, "role": "watch",
-      "auto_sleep": false, "bus": "127.0.0.1:25600" },
-    { "name": "survival", "host": "127.0.0.1", "port": 25566, "role": "auto",
-      "always_on": false,                    // true = 常驻，永不休眠
-      "bus": "127.0.0.1:25601" }
-  ],
-  "bus": { "bind": "auto", "token": "改成你自己的口令" },
-  "fake_server": { "enabled": true, "bind": "0.0.0.0" },
-  "announce": { "enabled": true, "warn_before_sleep": 0, "tell_attempt_players": true,
-                "sound": "minecraft:block.note_block.pling" }
+  "instance_name": "auto",       // 本实例的名字；auto = 用「我负责的那台子服」的名字
+  "language": "auto",            // 界面语言：auto 跟随 MCDR，也可写 zh_cn / en_us
+  "debug": false,                // 在控制台打印每轮侦察细节（排错才开）
+
+  "sleep": {                     // 【什么时候休眠】
+    "idle_timeout": 3600,        // 连续无人多久后休眠（秒）
+    "min_uptime": 300,           // 启动保护期：刚开好的这段时间内不判定空闲（秒）
+    "check_interval": 600,       // 侦察间隔（秒）
+    "state_tick": 5,             // 状态心跳（秒），让「刚关 / 刚开」几秒内就反映到界面
+    "wake_cooldown": 15,         // 两次「玩家连接触发唤醒」之间的最小间隔（秒）
+    "confirm_timeout": 30,       // !!ig confirm 的有效期（秒）
+    "busy_patterns": ["(?i)\\bbacking up\\b", "..."],   // 命中就认为服务端在备份，期间不自动休眠
+    "busy_hold_seconds": 300,    // 命中一次「忙」之后，往后多少秒不自动休眠
+    "ignore_players": []         // 统计时忽略的名字（正则），可用来忽略假人
+  },
+
+  "startup": {                   // 【起停与等待】
+    "startup_timeout": 300,      // 等服务端启动就绪的上限（秒）
+    "stop_timeout": 180,         // 等服务端停稳的上限（秒）
+    "port_release_timeout": 60,  // 启动前假服务端撤下、等端口可绑定的上限（秒）
+    "fallback_startup_seconds": 60,  // 还没实测过启动耗时前，报给玩家的预计值（秒）
+    "hot_startup_window": 300,   // 停机后这么快之内又被唤醒算「热启动」，ETA 按冷 / 热分别统计
+    "max_wake_failures": 3       // 连续启动失败几次后锁定自动唤醒
+  },
+
+  "announce": {                  // 【通知】
+    "enabled": true,
+    "tell_attempt_players": true,     // 单独提醒「刚被挡回来」的那位玩家（含音效）
+    "sound": "minecraft:block.note_block.pling",
+    "player_attempt_window": 600      // 记住「谁被挡回来过」多久（秒）
+  },
+
+  "fake_server": { "enabled": true },   // 休眠期间顶替端口的假服务端（关掉就没有「连接自动唤醒」）
+
+  "bus": {                       // 【实例间通信】
+    "bind": "auto",              // 本实例监听地址；auto = 照抄「我负责那条」的 servers[].bus
+    "token": "首次生成时自动填入随机串",  // 口令：所有实例必须一致
+    "timeout": 3.0
+  },
+
+  "velocity_config": "auto",     // 从 velocity.toml 自动补子服清单；"off" = 关闭
+
+  "servers": [                   // 【子服清单】这一段才是你真正要改的
+    { "name": "Survival", "host": "127.0.0.1", "port": 30000,
+      "role": "auto", "bus": "127.0.0.1:25600" },
+    { "name": "Creative", "host": "127.0.0.1", "port": 30001,
+      "role": "auto", "bus": "127.0.0.1:25601" }
+  ]
 }
 ```
 
 ### 顶层
 
-<details><summary>展开选项与说明</summary>
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `instance_name` | `"auto"` | 本实例的名字（日志与总线里用它标识自己）。`auto` = 用「本实例负责的那台子服」的名字，一般不用填 |
+| `language` | `"auto"` | `auto` 跟随 MCDR；可写 `zh_cn` / `en_us` |
+| `debug` | `false` | 在控制台打印每轮侦察的细节 |
+| `velocity_config` | `"auto"` | Velocity 的 `velocity.toml` 路径。`auto` = 在 MCDR 工作目录附近自动找；`off` = 关闭。见下面「子服清单自动同步」 |
+
+### `sleep`：什么时候休眠
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `language` | `"auto"` | `auto` 跟随 MCDR；可写 `zh_cn` / `en_us` |
+| `idle_timeout` | `3600` | 连续无人多久后休眠（秒）。可被 `servers[].idle_timeout` 单条覆盖 |
+| `min_uptime` | `300` | 启动保护期（秒）：服务端就绪后这段时间内不判定空闲。被唤醒的场景也由它保护 |
 | `check_interval` | `600` | 侦察间隔（秒）。调小反应更快，也更频繁地查端口 |
 | `state_tick` | `5` | 状态心跳间隔（秒）：只查本实例负责的子服，让「刚关 / 刚开」几秒内就反映到界面；`0` = 关闭心跳 |
-| `idle_timeout` | `3600` | 连续无人多久后休眠（秒）。可被 `servers[].idle_timeout` 覆盖 |
-| `min_uptime` | `300` | 启动后的保护期（秒），避免刚开就被判休眠 |
-| `grace_after_wake` | `300` | 被唤醒后的保护期（秒） |
+| `wake_cooldown` | `15` | 同一台服两次「玩家连接触发唤醒」之间的最小间隔（秒） |
+| `confirm_timeout` | `30` | `!!ig confirm` 的有效期（秒） |
+| `busy_patterns` | 见下 | 命中这些正则就认为服务端「正在忙」（备份 / 保存），期间不做**自动**休眠；清空成 `[]` 可关闭 |
+| `busy_hold_seconds` | `300` | 命中一次「忙」之后，往后这么多秒不做自动休眠（到点自动失效，不依赖「备份结束」日志） |
+| `ignore_players` | `[]` | 统计时忽略的名字（正则），可用来忽略假人 |
+
+`busy_patterns` 默认覆盖常见的备份插件文案（`backing up` / `backup started` / `world backup created` 等），
+故意不含原版的 `Saving the game`（那是几十毫秒级的例行保存，每次都延后一轮没有意义）。
+
+### `startup`：起停与等待
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
 | `startup_timeout` | `300` | 等服务端启动就绪的上限（秒） |
 | `stop_timeout` | `180` | 等服务端停稳的上限（秒） |
 | `port_release_timeout` | `60` | 启动前假服务端撤下、等端口可绑定的上限（秒） |
-| `wake_cooldown` | `15` | 同一台服两次连接触发的唤醒之间的最小间隔（秒） |
 | `fallback_startup_seconds` | `60` | 从没实测过启动耗时之前，给玩家报的预计值（秒） |
-| `player_attempt_window` | `600` | 记住「谁被挡回来过」的时长（秒），用于就绪后单独提醒 |
-| `ignore_players` | `[]` | 统计时忽略的名字（正则），可用来忽略假人 |
+| `hot_startup_window` | `300` | 「热启动」的判定窗口（秒）：停机后这么快之内又被唤醒算热启动 |
 | `max_wake_failures` | `3` | 连续启动失败几次后自动锁定 |
-| `confirm_timeout` | `30` | `!!ig confirm` 的有效期（秒） |
-| `velocity_config` | `"auto"` | Velocity 的 `velocity.toml` 路径。`auto` = 在 MCDR 工作目录附近自动找；`off` = 关闭。见下面「子服清单自动同步」 |
-| `busy_patterns` | 见下 | 命中这些正则就认为服务端「正在忙」（备份 / 保存），期间不做**自动**休眠；清空成 `[]` 可关闭 |
-| `busy_hold_seconds` | `300` | 命中一次「忙」之后，往后这么多秒不做自动休眠（到点自动失效，不依赖「备份结束」日志） |
-| `hot_startup_window` | `300` | 「热启动」的判定窗口（秒）：停机后这么快之内又被唤醒算热启动，ETA 按冷 / 热分别统计 |
-| `debug` | `false` | 在控制台打印每轮侦察的细节 |
 
-</details>
-
-### `servers[]`：子服清单
-
-<details><summary>展开选项与说明</summary>
+### `announce`：通知
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `name` | 必填 | 子服名，命令里可以直接用（也可以改用编号） |
-| `host` / `port` | 必填 | 状态查询要连的地址与端口 |
-| `role` | `"auto"` | 见下表 |
-| `auto_sleep` | `true` | 是否允许自动休眠（关掉后仍会显示空闲时长，只是不据此关服） |
-| `auto_wake` | `true` | 是否允许被玩家连接唤醒 |
-| `always_on` | `false` | **常驻**：自动判定不关它，`!!ig sleep`（含从别的实例发来的）也会被拒绝。适合希望长期开着的子服 |
-| `bus` | `""` | 该子服所在实例的总线地址，每台一个端口 |
-| `start_command` | `null` | `role: command` 时用 |
-| `stop_command` | `null` | `role: command` 时用 |
-| `working_directory` | `null` | `role: command` 时用；留空 = MCDR 工作目录 |
-| `idle_timeout` | `null` | 单独覆盖全局阈值（秒） |
-| `startup_timeout` | `null` | 单独覆盖全局启动上限（秒） |
+| `announce.enabled` | `true` | 总开关：关掉后不再广播「已休眠 / 已开启」 |
+| `announce.tell_attempt_players` | `true` | 单独提醒「试图进入但被挡住」的玩家 |
+| `announce.sound` | `minecraft:block.note_block.pling` | 提醒时放的音效（空字符串 = 不播放） |
+| `announce.player_attempt_window` | `600` | 记住「谁被挡回来过」的时长（秒），用于就绪后单独提醒 |
+
+### `servers[]`：子服清单（你真正要改的一段）
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `name` | 必填 | 子服名。命令里直接用（也可用编号）；与 `velocity.toml` / 子服目录名一致最省事 |
+| `host` | `"127.0.0.1"` | **从本实例这台机器看过去**该服务端的地址。同机就是 127.0.0.1；跨机器要写对方 IP |
+| `port` | `25565` | 该服务端的游戏端口。`role: auto` 就是靠它和 `server.properties` 的 `server-port` 对上来自认 |
+| `role` | `"auto"` | 谁负责它、怎么启停，见下表 |
+| `auto_sleep` | `true` | 到点是否允许**自动**关它；`false` = 只显示空闲时长、不据此关服 |
+| `auto_wake` | `true` | 玩家连接休眠中的它时，是否允许自动开起来 |
+| `always_on` | `false` | **常驻**：自动判定不关它，`!!ig sleep`（含别的实例发来的）也拒绝 |
+| `bus` | `null` | **负责它的那台 MCDR** 的总线地址；留 `null` = 没人负责（只能监视） |
+| `start_command` / `stop_command` / `working_directory` | `null` | 仅 `role: command` 用：本实例用命令启停它 |
+| `idle_timeout` | `null` | 单独给这台服设一个空闲阈值；`null` = 用 `sleep.idle_timeout` |
+
+> `null` 的含义是「**这一格不设置**」，不是"缺了东西"。为什么会有一堆 `null`、分别是什么意思，
+> 见下面「[为什么很多字段是 `null`](#为什么很多字段是-null)」。
+
+**最省事的写法**：如果你的每个子服都有自己的一份 MCDR，那么**只填 `name` / `host` / `port` / `bus` 四个字段就够了**
+（`role` 保持默认的 `auto`），其余全部省略，省略掉的字段 MCDR 会自动按默认值补上。
 
 `role` 的取值：
 
 | role | 含义 |
 |---|---|
-| `auto`（默认） | 自动判定：端口与 MCDR 工作目录下 `server.properties` 的 `server-port` 相同的那台，就是「本实例负责」的服务端 |
-| `self` | 本实例负责（用 MCDR 的 start / stop 控制，人数用 MCDR 事件精确统计） |
+| `auto`（默认，推荐） | 自动判定：端口与 MCDR 工作目录下 `server.properties` 的 `server-port` 相同的那台，就是「本实例负责」的服务端 |
+| `self` | 强制指定「本实例负责」（用 MCDR 的 start / stop 控制，人数用 MCDR 事件精确统计） |
 | `command` | 本实例用命令启停（需填 `start_command` / `stop_command` / `working_directory`） |
 | `watch` | 只监视、只转发通知，不启停 |
 
-`role: auto` 加上 `bus.bind: "auto"` 之后，**同一份配置可以原封不动复制到每台 MCDR**：
-每个实例按 `server.properties` 的端口认出自己是谁，并取对应条目的 `bus` 地址当自己的监听地址。
-需要为每台机器区分的只有 `servers[].bus` 这一列。
+**能不能全部写 `auto`？** 可以，而且推荐。`auto` 的意思就是"谁的服务端端口对得上，谁负责它"：
+本实例认领自己的那台，别的实例的那台自动显示成「对方实例」。只有一种情况要特殊处理：
+
+- **某台子服没有自己的 MCDR**（例如只是镜像，或由别的插件启停）→ 没有任何实例会认领它，
+  它会一直显示「只监视」，配的 `auto_sleep` 也永远不会生效。这时要么改成 `role: command`
+  （指定由某一台实例用命令启停它），要么把 `auto_sleep` 关掉（承认"没人关它"）。
+- `role: self` 只在你想**绕开端口嗅探、固定指定**时才需要；端口对不上时控制台会警告。
+  所以除非排错，一般不必写 `self`。
+
+**`host` / `port` 和 `bus` 为什么要各写一次？** 它们回答的不是同一个问题：
+
+| 字段 | 回答的问题 | 用途 |
+|---|---|---|
+| `host` + `port` | 「**本实例**怎么连到那台服务端」 | 状态查询、探端口、假服务端顶替端口（游戏端口） |
+| `bus` | 「**别的实例**怎么连到管它的那台 MCDR」 | 跨服通知、在别的实例上远程启停（总线端口） |
+
+游戏端口和总线端口本来就无关（一个是 Minecraft 在听，一个是 MCDR 在听），所以不能合并成一处。
+能合并的是另一半：`bus` 其实可以挪到顶层按实例写一次（`instances: { "Creative": "127.0.0.1:25601" }`），
+这样每条子服少一行、一台 MCDR 管多台子服时也不必重复填；这条还在待办里。
+
+**`bus.bind` 和 `servers[].bus` 的区别**：前者是「**本实例自己**在哪个地址上听消息」，
+后者是「**负责那台子服的那台 MCDR**在哪个地址等消息」。因为 `bus.bind` 默认 `"auto"`
+（= 照抄「本实例负责那条」的 `servers[].bus`），所以**地址实际上只在 `servers[].bus` 里写一遍**，
+`bus.bind` 通常根本不用动。
 
 **子服清单自动同步（`velocity_config`）**：Velocity 里本来就写着每个子服的名字与地址，不必再手抄一遍。
 插件启动时会读一遍 `velocity.toml` 的 `[servers]` 段，把**还没写进 `servers[]`** 的条目补进来
@@ -203,19 +280,40 @@ survival 已休眠
 里对不上，只会在控制台提醒一句、保留你的配置。`auto` 会在 MCDR 工作目录、上一级、`Velocity/`
 等常见位置找 `velocity.toml`；找不到就安静跳过，不影响运行。不想用它就写 `"off"`。
 
-</details>
-
 ### `bus`：实例间总线
 
 <details><summary>展开选项与说明</summary>
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `bus.bind` | `"auto"` | 本实例监听的地址；`auto` = 取「本实例负责的子服」那条的 `bus` |
-| `bus.token` | `"idle_guard"` | 连接口令，**请改掉**；只允许本机 / 内网使用 |
+| `bus.bind` | `"auto"` | 本实例监听的地址。`auto` = 照抄「本实例负责的那条子服」的 `bus`，也可直接写 `127.0.0.1:25600`；**留空（`null` / `""`）与 `auto` 等价**。填的若不是合法地址，会在控制台报错并不启动总线 |
+| `bus.token` | **随机串** | 连接口令。**首次生成配置时自动填入随机串**，你也可以改成任意字符串，但**所有实例必须一致**，否则会互相报「鉴权失败」 |
 | `bus.timeout` | `3.0` | 单次请求超时（秒） |
 
+口令为什么默认是随机串：它一旦是公开的固定值，跨机器部署就等于没有防线：
+任何拿到那串字符的人都能连上你的总线，替你对子服下达休眠 / 唤醒指令。
+如果这个实例**只在本机用**、也不需要别的实例连它，其实可以不设口令；但只要 `bind` 不是回环地址
+（例如跨机器部署绑了 `0.0.0.0`），它就**是唯一防线**。
+
+`!!ig check` 会显示当前口令的**指纹**（8 位十六进制）；两个实例对不上时，用它可以一眼看出
+是"口令不一致"还是"那台实例没运行"（这两种表现都是连不上，很难分）。
+
 </details>
+
+### 为什么很多字段是 `null`
+
+文件里会看到不少 `null`（尤其是 `servers[]` 里那几行）。这不是"缺了东西"，而是「**这一格不设置**」：
+
+| 字段 | `null` 的含义 |
+|---|---|
+| `servers[].start_command` / `stop_command` / `working_directory` | 只有 `role: command` 用得上；其它角色（`auto` / `self` / `watch`）用 MCDR 的方式启停，这几格不需要 |
+| `servers[].idle_timeout` | **单独覆盖**用：留 `null` = 跟随 `sleep.idle_timeout` |
+| `bus.bind` | 留 `null` / `""` 与 `"auto"` 等价（都是"没设置 → 走自动规则"） |
+
+之所以不能靠"删掉这几行"来让文件变短：MCDR 读配置时发现缺字段会**按默认值补全，并把整份文件重写回去**，
+所以删了下次启动就会长回来。MCDR 的 JSON 也不支持注释，因此这些字段的说明只能放在这份 README 里。
+
+一句话：**`null` = 用默认值 / 这一格不适用**，改成具体值就表示"这一格我要自己定"。
 
 ### `fake_server`：休眠期间顶替端口
 
@@ -224,20 +322,8 @@ survival 已休眠
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | `fake_server.enabled` | `true` | 关掉后玩家连接会看到代理的默认报错，也不能自动唤醒 |
-| `fake_server.bind` | `"0.0.0.0"` | 假服务端绑定的地址，需要与真实服务端一致（否则玩家连不上） |
 
-</details>
-
-### `announce`：通知
-
-<details><summary>展开选项与说明</summary>
-
-| 选项 | 默认 | 说明 |
-|---|---|---|
-| `announce.enabled` | `true` | 休眠 / 开启时是否广播给全群组 |
-| `announce.warn_before_sleep` | `0` | 休眠前多少秒先预告一次；`0` = 不预告 |
-| `announce.tell_attempt_players` | `true` | 是否单独提醒「想进但被挡住」的那位玩家 |
-| `announce.sound` | `"minecraft:block.note_block.pling"` | 服开好后放给那位玩家的音效；`""` = 不播放 |
+假服务端的监听地址固定 `0.0.0.0`（和真实服务端一致），不做成选项：它没有需要按机器区分的场景。
 
 </details>
 
