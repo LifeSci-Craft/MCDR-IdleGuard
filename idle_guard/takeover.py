@@ -15,6 +15,7 @@ import time
 from typing import Optional
 
 from .fakeserver import FakeServer
+from .config import FAKE_SERVER_BIND
 from .models import ManagedServer, State, safe_player_name
 
 
@@ -46,7 +47,7 @@ class TakeoverMixin:
             return
         if managed.fake is None:
             managed.fake = FakeServer(
-                bind_host=self._config.fake_server.bind,
+                bind_host=FAKE_SERVER_BIND,
                 port=managed.entry.port,
                 status_factory=lambda protocol, name=managed.name: self._fake_status(name, protocol),
                 kick_factory=lambda name=managed.name: self._fake_kick(name),

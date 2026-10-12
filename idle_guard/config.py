@@ -9,8 +9,9 @@ MCDR 会在 `config/idle_guard/config.json` 生成默认配置文件；改动后
 命令输出等）都在插件的 `lang/<语言>.json` 里（见 `i18n.py`），
 用 `language` 字段选语言；想改文案就在 `config/idle_guard/lang/` 下放同名覆盖文件。
 """
+import secrets
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from mcdreforged.api.utils import Serializable
 
@@ -55,21 +56,41 @@ class ServerEntry(Serializable):
     stop_command: Optional[str] = None
     #: role=command 时使用；命令的工作目录
     working_directory: Optional[str] = None
-    #: 覆盖全局的空闲阈值（秒）
+    #: 覆盖全局的空闲阈值（秒）；留 null = 跟随顶层的 idle_timeout
     idle_timeout: Optional[float] = None
-    #: 覆盖全局的启动超时（秒）
-    startup_timeout: Optional[float] = None
+
+
+#: 假服务端监听的地址（写死，不做成选项）。真实服务端一般监听 0.0.0.0，
+#: 假服务端跟着它走才是对的：任何能连到真实服务端的地址，休眠期间也该能连到它。
+FAKE_SERVER_BIND = '0.0.0.0'
+
+#: 总线口令的**历史默认值**。早期版本生成的配置里就是它；
+#: 现在新生成的配置会自动填入随机串（见 new_bus_token），保留这个常量只为让自检能提醒老配置改掉。
+LEGACY_BUS_TOKEN = 'idle_guard'
+
+
+def new_bus_token() -> str:
+    """生成一个新的总线口令（首次生成配置文件时自动填入）。
+
+    为什么不留一个写死的默认口令：它是公开的 —— 一旦跨机器部署，谁都能拿它连上你的总线，
+    替你对子服下达休眠/唤醒指令。所以默认给随机串；你想自定义也完全可以，
+    改 `bus.token` 即可（**多个实例必须改成同一个值**，否则会互相报「鉴权失败」）。
+    """
+    return secrets.token_urlsafe(18)
 
 
 @dataclass
 class BusConfig(Serializable):
     """实例间通信总线配置。"""
 
-    #: 本实例监听的地址，如 "127.0.0.1:25601"；留空 = 不接收跨服消息（仍可向别人发）
-    #: 填 "auto" 时会自动取「本实例负责的子服条目」上写的 bus 地址，方便各实例共用同一份配置
-    bind: Optional[str] = None
-    #: 通信口令，所有实例必须一致
-    token: str = 'idle_guard'
+    #: 本实例监听的地址，如 "127.0.0.1:25601"。
+    #: 默认 "auto" = 照抄「本实例负责的那条子服」上写的 bus（见 servers[].bus）——
+    #: 这样同一份配置可以直接复制到每个实例，不必为每台机器单独改这里。
+    #: 留空（`null` / `""`）与 "auto" 等价：没设置就走自动规则
+    #: （以前这里默认就是空的，老配置升级后因此能自动获得这个行为，不必手改）。
+    bind: Optional[str] = 'auto'
+    #: 通信口令，**所有实例必须一致**。首次生成配置时自动填入随机串，也可自行修改。
+    token: str = field(default_factory=new_bus_token)
     #: 单次请求超时（秒）
     timeout: float = 3.0
 
@@ -78,12 +99,12 @@ class BusConfig(Serializable):
 class FakeServerConfig(Serializable):
     """假服务端配置（顶替休眠中的真实服务端端口）。
 
-    这里只留行为开关；MOTD / 版本名 / 玩家看到的提示文字都在 lang/<语言>.json。
+    这里只留一个开关；MOTD / 版本名 / 玩家看到的提示文字都在 lang/<语言>.json。
+    监听地址固定 0.0.0.0（与真实服务端一致），不做成选项：它没有需要按机器区分的场景，
+    留着只会多一行"要不要改"的疑问。
     """
 
     enabled: bool = True
-    #: 绑定地址。真实服务端一般监听 0.0.0.0，这里保持默认即可
-    bind: str = '0.0.0.0'
 
 
 @dataclass
@@ -91,8 +112,6 @@ class AnnounceConfig(Serializable):
     """通知行为开关（文案在 lang/<语言>.json）。"""
 
     enabled: bool = True
-    #: 休眠前多少秒先预告一次（0 = 不预告，直接发"已休眠"）
-    warn_before_sleep: float = 0.0
     #: 是否单独提醒"试图进入但被挡住"的玩家
     tell_attempt_players: bool = True
     #: 服务端开好之后，给那位被挡住的玩家放的音效（空字符串 = 不播放）
@@ -118,10 +137,9 @@ class Config(Serializable):
     state_tick: float = 5.0
     #: 全局空闲阈值：连续无人多少秒后休眠
     idle_timeout: float = 3600.0
-    #: 启动后保护期：服务端启动完成后的这段时间内不判定空闲（秒）
+    #: 启动保护期：服务端启动完成后这段时间内不判定空闲（秒），避免"刚开就关"。
+    #: 被唤醒的场景也由它保护（唤醒后服务端就绪 → 起算），所以不再单独设"唤醒保护期"
     min_uptime: float = 300.0
-    #: 被唤醒后的保护期：这段时间内不再休眠（秒），避免刚开就关
-    grace_after_wake: float = 300.0
     #: 等待服务端启动完成的超时（秒）
     startup_timeout: float = 300.0
     #: 等待服务端停止完成的超时（秒）
@@ -175,5 +193,97 @@ class Config(Serializable):
     ])
 
 
+    # ------------------------------------------------------------------ #
+    # 文件布局：**只在写进 config.json / 从 config.json 读时**按功能分组
+    # ------------------------------------------------------------------ #
+    # 内部字段一律平铺（`config.idle_timeout`），一是代码与测试都直接读属性，
+    # 二是这样"老配置（平铺）"与"新配置（分组）"能同时读 —— 不必写迁移、不会丢值。
+
+    def serialize(self) -> dict:
+        """写文件时按 `CONFIG_LAYOUT` 分组（只影响文件长相，属性访问不变）。"""
+        return _group_layout(super().serialize())
+
+    @classmethod
+    def deserialize(cls, data, **kwargs):
+        """读文件时先把分组摊平：分组的、平铺的老配置都能读。"""
+        return super().deserialize(_flatten_layout(data), **kwargs)
+
 #: role 的合法取值
 VALID_ROLES = ('auto', 'self', 'command', 'watch')
+
+
+# --------------------------------------------------------------------------- #
+# 配置文件的分组布局
+# --------------------------------------------------------------------------- #
+
+#: 文件里按功能分组：「一眼找到要改的那一项」比少两行更重要。
+#: 键 = 组名，值 = 组内字段。组名与已有的子对象同名（如 `announce`）时表示"塞进那个子对象里"。
+CONFIG_LAYOUT: Dict[str, Tuple[str, ...]] = {
+    # 什么时候休眠 / 空闲怎么判定
+    'sleep': (
+        'idle_timeout', 'min_uptime', 'check_interval', 'state_tick', 'wake_cooldown',
+        'confirm_timeout', 'busy_patterns', 'busy_hold_seconds', 'ignore_players',
+    ),
+    # 起停一台服务端要等多久
+    'startup': (
+        'startup_timeout', 'stop_timeout', 'port_release_timeout',
+        'fallback_startup_seconds', 'hot_startup_window', 'max_wake_failures',
+    ),
+    # 通知相关（这个组本身就是一个子对象，多放进去的字段会在读的时候摊回顶层）
+    'announce': ('player_attempt_window',),
+}
+
+#: 生成文件时的字段顺序（没有列到的字段会按原顺序补在后面）
+CONFIG_FILE_ORDER: Tuple[str, ...] = (
+    'instance_name', 'language', 'debug',
+    'sleep', 'startup', 'announce', 'fake_server', 'bus',
+    'velocity_config', 'servers',
+)
+
+
+def _group_layout(flat: dict) -> dict:
+    """平铺字段 → 分组后的文件内容。"""
+    out: dict = {}
+    placed: set = set()
+    for key in CONFIG_FILE_ORDER:
+        names = CONFIG_LAYOUT.get(key)
+        if names is None:
+            if key in flat:
+                out[key] = flat[key]
+                placed.add(key)
+            continue
+        bucket = {name: flat[name] for name in names if name in flat}
+        existing = flat.get(key)           # 例如 announce 这个真子对象
+        if isinstance(existing, dict):
+            merged = dict(existing)
+            merged.update(bucket)
+            bucket = merged
+        if bucket:
+            out[key] = bucket
+        placed.add(key)
+        placed.update(names)
+    for key, value in flat.items():        # 兜底：以后新增的字段也不会被这里弄丢
+        if key not in placed:
+            out[key] = value
+    return out
+
+
+def _flatten_layout(data) -> dict:
+    """分组后的文件内容 → 平铺字段（老配置本来就是平铺的，原样通过）。"""
+    if not isinstance(data, dict):
+        return data
+    flat = dict(data)
+    for group, names in CONFIG_LAYOUT.items():
+        bucket = flat.get(group)
+        if not isinstance(bucket, dict):
+            continue
+        leftover = {key: value for key, value in bucket.items() if key not in names}
+        for name in names:
+            # 平铺写法优先：两个地方都写了的话，以顶层那个为准（它更显眼）
+            if name in bucket and name not in data:
+                flat[name] = bucket[name]
+        if leftover:
+            flat[group] = leftover
+        else:
+            flat.pop(group, None)
+    return flat
