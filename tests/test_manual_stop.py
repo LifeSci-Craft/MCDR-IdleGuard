@@ -32,12 +32,11 @@ def build(*, state_tick: float = 0.3):
         state_tick=state_tick,
         idle_timeout=9999.0,
         min_uptime=0.0,
-        grace_after_wake=0.0,
         startup_timeout=5.0,
         stop_timeout=3.0,
         port_release_timeout=3.0,
         bus=BusConfig(bind=None, token='t', timeout=1.0),
-        fake_server=FakeServerConfig(enabled=True, bind='127.0.0.1'),
+        fake_server=FakeServerConfig(enabled=True),
         announce=AnnounceConfig(enabled=True),
         servers=[
             ServerEntry(name='Survival', host='127.0.0.1', port=free_port(), role='self',

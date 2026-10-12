@@ -53,7 +53,6 @@ def build(*, idle_timeout: float = 9999.0, players: int = 0, state: str = State.
         check_interval=0.3,
         idle_timeout=idle_timeout,
         min_uptime=0.0,
-        grace_after_wake=0.0,
         startup_timeout=5.0,
         stop_timeout=3.0,
         port_release_timeout=3.0,
@@ -63,7 +62,11 @@ def build(*, idle_timeout: float = 9999.0, players: int = 0, state: str = State.
         announce=AnnounceConfig(enabled=False),
         servers=[
             ServerEntry(name='Survival', host='127.0.0.1', port=free_port(), role='self'),
-            ServerEntry(name='Creative', host='127.0.0.1', port=free_port(), role='watch'),
+            # Creative 由"别的实例"管：真实配置里必须写它的总线地址，否则本实例根本联系不上那台实例。
+            # （这里原来没写 bus，只是靠"桩忽略入参"才让测试跑过去；现在 `live_views()` 只为
+            #  "有地址、且没有可用缓存"的对端发问，所以这一格必须补上才符合真实场景。）
+            ServerEntry(name='Creative', host='127.0.0.1', port=free_port(), role='watch',
+                        bus='127.0.0.1:25601'),
         ],
     )
     stub = StubMCDR()

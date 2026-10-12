@@ -34,7 +34,8 @@ class Source:
         return '\n'.join(self.replies)
 
 
-def build(*, always_on: bool = False, idle_timeout: float = 9999.0, peer_bus: str = ''):
+def build(*, always_on: bool = False, idle_timeout: float = 9999.0, peer_bus: str = '',
+          bus_bind=None, state_tick: float = 9999.0):
     entries = [
         ServerEntry(name='Survival', host='127.0.0.1', port=free_port(), role='self',
                     auto_sleep=True, auto_wake=True, always_on=always_on),
@@ -47,15 +48,14 @@ def build(*, always_on: bool = False, idle_timeout: float = 9999.0, peer_bus: st
         instance_name='Survival',
         language='zh_cn',
         check_interval=9999.0,
-        state_tick=9999.0,                 # 心跳关掉：测试里手动驱动，避免抢跑
+        state_tick=state_tick,             # 默认关掉：测试里手动驱动，避免抢跑
         idle_timeout=idle_timeout,
         min_uptime=0.0,
-        grace_after_wake=0.0,
         startup_timeout=5.0,
         stop_timeout=3.0,
         port_release_timeout=3.0,
-        bus=BusConfig(bind=None, token='t', timeout=0.6),
-        fake_server=FakeServerConfig(enabled=False, bind='127.0.0.1'),
+        bus=BusConfig(bind=bus_bind, token='t', timeout=0.6),
+        fake_server=FakeServerConfig(enabled=False),
         announce=AnnounceConfig(enabled=False),
         servers=entries,
     )
@@ -134,6 +134,65 @@ def test_diag_precheck_reports_always_on(pinger):
         assert wait_until(lambda: supervisor.state_of('Survival').state == State.RUNNING, 10)
         checks = supervisor.sleep_checklist('Survival')
         assert any(not ok and '常驻' in text for ok, text in checks), checks
+    finally:
+        supervisor.shutdown()
+
+
+def test_diag_says_why_the_bus_did_not_start(pinger):
+    """线上反馈：diag 只回一句「总线未配置」，没说是哪一种原因，用户无从下手。
+
+    现在按三种情形分别说明：本条（值非法）／「本实例负责那条少写了 bus」（见下一条测试）／
+    「本实例不负责任何子服，用不上总线」（正常，灰色提示）。
+    """
+    supervisor, _stub = build(bus_bind='off')             # 填了个不是地址的值
+    try:
+        supervisor.start()
+        text = '\n'.join(line for line, _colour in diag_mod.rows(supervisor))
+        assert 'off' in text and '不是合法地址' in text, text
+    finally:
+        supervisor.shutdown()
+
+
+def test_diag_points_at_the_entry_missing_its_bus(pinger):
+    """`bus.bind: auto` 是「照抄本实例负责那条的 bus」—— 那条没写就要点名是哪条。"""
+    supervisor, _stub = build(bus_bind='auto')          # Survival 条目没写 bus
+    try:
+        supervisor.start()
+        text = '\n'.join(line for line, _colour in diag_mod.rows(supervisor))
+        assert 'bus.bind 是 auto' in text, text
+        assert 'Survival' in text and '那条没写 bus' in text, text
+    finally:
+        supervisor.shutdown()
+
+
+def test_diag_says_the_peer_name_is_unknown(pinger):
+    """从没连上的对端，实例名位置原来只有一个 `?`，读的人不知道那是什么意思。"""
+    supervisor, _stub = build(peer_bus='127.0.0.1:1',    # 没人监听的地址
+                              state_tick=0.2)            # 让心跳跑起来：对端探测是它负责的
+    try:
+        supervisor.start()
+        assert wait_until(lambda: bool(supervisor.peer_health()), 10), '心跳没记录对端状态'
+        text = '\n'.join(line for line, _colour in diag_mod.rows(supervisor))
+        assert '对端 127.0.0.1:1' in text, text
+        assert '实例名未知' in text, text
+    finally:
+        supervisor.shutdown()
+
+
+def test_diag_warns_that_an_unowned_server_will_never_sleep(pinger):
+    """配了自动休眠却没有任何实例负责它 —— 那条配置永远生效不了，必须点出来。
+
+    线上就是这个情形：Creative 写着 `auto_sleep: true`，却一直显示「只监视」，
+    用户以为有人在管它，实际它永远不会被关。
+    """
+    supervisor, _stub = build(peer_bus='127.0.0.1:1')
+    try:
+        supervisor.start()
+        assert wait_until(lambda: supervisor.state_of('Survival').state == State.RUNNING, 10)
+        text = '\n'.join(line for line, _colour in diag_mod.rows(supervisor))
+        creative = [line for line in text.splitlines() if 'Creative' in line]
+        assert creative, text
+        assert '没有实例负责它' in creative[0] and '不会生效' in creative[0], creative[0]
     finally:
         supervisor.shutdown()
 

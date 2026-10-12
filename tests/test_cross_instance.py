@@ -37,7 +37,6 @@ def _config(name: str, bus_port: int, peer_port: int) -> Config:
         check_interval=0.3,
         idle_timeout=9999.0,
         min_uptime=0.0,
-        grace_after_wake=0.0,
         startup_timeout=5.0,
         stop_timeout=3.0,
         port_release_timeout=3.0,
@@ -45,7 +44,7 @@ def _config(name: str, bus_port: int, peer_port: int) -> Config:
         fallback_startup_seconds=5.0,
         debug=True,
         bus=BusConfig(bind=f'127.0.0.1:{bus_port}', token='t', timeout=2.0),
-        fake_server=FakeServerConfig(enabled=True, bind='127.0.0.1'),
+        fake_server=FakeServerConfig(enabled=True),
         announce=AnnounceConfig(enabled=False),
         servers=entries,
     )
