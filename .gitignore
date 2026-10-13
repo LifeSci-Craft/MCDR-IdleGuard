@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ruff_cache/
 
 # 本地工具链与运行数据（不进仓库）
 .workbuddy/
@@ -12,3 +13,8 @@ logs/
 
 # 构建中间产物
 dist/
+
+# 打包产物：作为 Release 资产分发，不进版本库。
+# （1.0.0 与 1.1.0 都提交过一次 —— 每次发版往历史里塞一个 60 KB 二进制，
+#  而且"仓库里那份"与"发出去那份"可能悄悄不一致。）
+idle_guard-*.mcdr
