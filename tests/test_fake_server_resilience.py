@@ -7,14 +7,17 @@
    玩家连接收不到任何回复、也触发不了唤醒，而且日志里一句提示都没有（实测复现过）。
    总线那处同样的坑此前已修，这里是同类的第二处。
 2. 每条连接占一个线程（读超时 5 秒 + 等对端关闭 2 秒），不限个数就可能被打满线程与句柄，
-   而句柄一满正好会触发第 1 条。
+   而句柄一满正好会触发第 1 条。所以：正常名额用满后还有一小段**溢出名额**（短预算，
+   让玩家仍能收到提示、仍能触发唤醒），再超出就必须**有交代**地拒掉 ——
+   算一次登录尝试 + 记一条 warning + 关连接，而不是像以前那样静默丢弃
+   （玩家什么提示都看不到、也唤不醒服务端，控制台连一行日志都没有）。
 """
 from __future__ import annotations
 
 import socket as socket_module
 import time
 
-from idle_guard.fakeserver import MAX_CONNECTIONS, FakeServer
+from idle_guard.fakeserver import MAX_CONNECTIONS, OVERFLOW_CONNECTIONS, FakeServer
 from mc_test_utils import CollectingLogger, free_port, login_attempt, wait_until
 
 
@@ -85,16 +88,48 @@ def test_stopping_the_fake_server_still_ends_the_accept_loop(monkeypatch):
 # --------------------------------------------------------------------------- #
 # ② 连接数上限
 
-def test_connections_beyond_the_limit_are_dropped_instead_of_piling_up():
-    fake, _attempts, logger = make_fake(max_connections=3, read_timeout=3.0, linger_timeout=1.0)
+def test_a_burst_is_bounded_by_the_normal_cap_plus_the_overflow_budget():
+    """突发连接的总量不得超过「正常名额 + 溢出名额」。
+
+    溢出名额是给真实玩家的：他们撞上满员时仍然要能收到提示、仍然要能唤醒服务端。
+    """
+    fake, _attempts, logger = make_fake(max_connections=3, max_connections_per_ip=64,
+                                        read_timeout=3.0, linger_timeout=1.0)
     held: list = []
     try:
         assert fake.start()
-        for _ in range(6):                                # 连上就不说话，占住处理线程
-            held.append(socket_module.create_connection(('127.0.0.1', fake.port), timeout=2.0))
-        assert wait_until(lambda: fake.active_connections >= 3, 5), fake.active_connections
+        for _ in range(3 + OVERFLOW_CONNECTIONS + 4):      # 连上就不说话，占住处理线程
+            try:
+                held.append(socket_module.create_connection(('127.0.0.1', fake.port), timeout=2.0))
+            except OSError:
+                pass
         time.sleep(0.5)
-        assert fake.active_connections <= 3, '并发上限没生效'
+        assert fake.active_connections <= 3 + OVERFLOW_CONNECTIONS, fake.active_connections
+        assert '已达上限' in logger.text(), logger.text()
+    finally:
+        for conn in held:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        fake.stop()
+
+
+def test_connections_over_the_per_ip_cap_are_dropped_but_still_count_as_an_attempt():
+    """单机把名额占满后，超出的连接**照样算一次登录尝试**（唤醒不能丢），但不再开线程。
+
+    这是"静默失效"的回归测试：以前超限只 `_close_quietly` + `debug` 日志 ——
+    玩家既看不到提示、也触发不了唤醒，而控制台一句提示都没有。
+    """
+    fake, attempts, logger = make_fake(max_connections=64, max_connections_per_ip=2,
+                                       read_timeout=3.0, linger_timeout=1.0)
+    held: list = []
+    try:
+        assert fake.start()
+        for _ in range(5):
+            held.append(socket_module.create_connection(('127.0.0.1', fake.port), timeout=2.0))
+        assert wait_until(lambda: fake.active_connections <= 2, 5), fake.active_connections
+        assert wait_until(lambda: len(attempts) >= 3, 5), attempts
         assert '已达上限' in logger.text(), logger.text()
     finally:
         for conn in held:

@@ -12,7 +12,7 @@ server that has players online (or whose player count cannot be confirmed).
 
 [![MCDR](https://img.shields.io/badge/MCDReforged-%3E%3D2.13-blue)](https://mcdreforged.com/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue)](https://www.python.org/)
 
 **English** | [简体中文](README.md)
 
@@ -61,7 +61,7 @@ server that has players online (or whose player count cannot be confirmed).
 The status table in the console:
 
 ```
-================= Idle Guard v1.1.0 ==================
+================= Idle Guard v1.2.0 ==================
 #  Server    Role      State     Players  Note        Switch
 1  Survival  local     running   1/20     @Survival   [Sleep]
 2  Creative  remote    sleeping  0        @Creative   [Wake]
@@ -72,7 +72,7 @@ In game the same data is shown, every cell has a hover tooltip, and the switch a
 
 ## Installation
 
-1. Put `idle_guard-1.1.0.mcdr` into the `plugins/` folder of **the MCDR of every backend server**
+1. Put `idle_guard-1.2.0.mcdr` into the `plugins/` folder of **the MCDR of every backend server**
    (one instance per server is recommended);
 2. run `!!MCDR plugin reload idle_guard`, or restart MCDR;
 3. the first start creates `config/idle_guard/config.json`. **Adjust `servers` to your own topology before letting
@@ -314,6 +314,7 @@ machines) it is **the only defence**.
 
 `!!ig check` prints a **fingerprint** of the current secret (8 hex digits) - when two instances cannot talk, that
 tells you instantly whether it is a "different token" problem or a "that instance is not running" problem.
+The secret itself is never written to the log (logs tend to get pasted around); compare fingerprints instead.
 
 </details>
 

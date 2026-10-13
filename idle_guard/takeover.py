@@ -31,6 +31,10 @@ class TakeoverMixin:
 
         retry=True 时，绑定失败会再挂一个后台线程持续重试（见 _ensure_takeover_retry）。
         """
+        if self._stopping.is_set():
+            # 插件正在卸载：绝不能再把端口抢回来。否则表现为"插件已经卸下了，
+            # 端口上却还挂着假服务端"（轮询线程可能在 shutdown 的 join 超时后仍在跑）。
+            return
         need_fake = (
             self._config.fake_server.enabled
             and managed.entry.auto_wake
@@ -61,6 +65,14 @@ class TakeoverMixin:
                 # 于是它会悄悄把玩家连接抢走（比"暂时连不上"严重得多）
                 if retry:
                     self._ensure_takeover_retry(managed)
+                return
+            # ⚠️ bind 之前必须**再确认一次**状态：上面的 need_fake 判断是在进入本函数时做的，
+            # 而 _can_start_fake 在 role != self 时会做一次最长 0.5 秒的 TCP 探测 ——
+            # 这半秒里唤醒流程完全可能把状态推到 STARTING 并开始启动真实服务端
+            # （_take_over_port 与后台重试线程都不持有 managed.action_lock）。
+            # 少了这一道，就可能把"正在启动的真实服务端"的端口抢过来：轻则唤醒失败，
+            # Windows 上还会出现两个 socket 并存、玩家被假服务端分走。
+            if self._stopping.is_set() or managed.state in (State.STARTING, State.RUNNING):
                 return
             if managed.fake.start(force=force):
                 if managed.state == State.OFFLINE:
@@ -172,6 +184,8 @@ class TakeoverMixin:
 
     def _ensure_takeover_retry(self, managed: ManagedServer) -> None:
         """起一个后台线程，每 0.25 秒试一次，直到假服务端接管端口（或被唤醒）。"""
+        if self._stopping.is_set():
+            return
         if not self._config.fake_server.enabled or not managed.entry.auto_wake:
             return
         alive = managed.takeover_thread is not None and managed.takeover_thread.is_alive()

@@ -20,10 +20,10 @@ from mcdreforged.api.types import PluginServerInterface
 
 from . import commands, i18n
 from .config import Config
-from .supervisor import Supervisor
+from .supervisor import Supervisor, token_fingerprint
 
 PLUGIN_ID = 'idle_guard'
-PLUGIN_VERSION = '1.1.0'
+PLUGIN_VERSION = '1.2.0'
 
 _supervisor: Optional[Supervisor] = None
 
@@ -40,8 +40,12 @@ def _load_config(server: PluginServerInterface) -> Config:
         raise
     if first_run:
         # bus.token 的默认值是 new_bus_token() 现生成的随机串（不再是公开的固定口令），
-        # 但它必须与其它实例一致 —— 所以这里把值印出来，并说明该复制到哪儿去。
-        server.logger.info(f'已生成新配置，总线口令 bus.token = {config.bus.token}')
+        # 但它必须与其它实例一致 —— 所以这里提醒一次。
+        # ⚠️ 口令本身**不打印**：这个插件的日志是要求"出问题就整段贴出来"的，而日志会被
+        # 贴进 issue、截图与聊天里。要对照两边是否一致，用 `!!ig check` 看指纹即可
+        # （口令不同、指纹却相同的可能性可以忽略）。
+        server.logger.info(f'已生成新配置，总线口令指纹 {token_fingerprint(config.bus.token)}'
+                           '（口令本身不打印，可在 config.json 的 bus.token 里看到）')
         server.logger.info('若你还有别的 MCDR 实例：请把这串口令填到它们 config.json 的同一字段'
                           '（对不上会报「鉴权失败」）；只有这一个实例则可以不管')
     return config
@@ -62,14 +66,28 @@ def on_load(server: PluginServerInterface, prev_module) -> None:
 
     config = _load_config(server)
     _supervisor = Supervisor(server, config, plugin_id=PLUGIN_ID, plugin_version=PLUGIN_VERSION)
-    _supervisor.start()
-    commands.register(server, _supervisor)
-    # help 列表里的说明交给 MCDR 按它自己的语言挑（不点插件界面的语言）；
-    # 权限传 PERM_ADMIN：`!!ig` 全部命令都只给管理员用，所以不该出现在普通玩家的 !!help 里
-    server.register_help_message('!!ig', {
-        'zh_cn': i18n.translate('command.help.mcdr', 'zh_cn'),
-        'en_us': i18n.translate('command.help.mcdr', 'en_us'),
-    }, permission=commands.PERM_ADMIN)
+    # ⚠️ 下面三步都要兜住。MCDR 会吞掉 on_load 里抛出的异常、却仍然认为"这个插件加载过"，
+    # 于是失败之后会留下**半初始化**状态：_supervisor 已经赋值、后台轮询线程可能已经起来，
+    # 而命令没注册完 —— 下一次 reload 的行为就不可预期了（配置里一个笔误就够触发，
+    # 例如 bus.bind 的端口写成 99999）。
+    # 所以：出错就自己收干净（停线程、停假服务端、停总线）再把异常抛给 MCDR 记日志。
+    try:
+        _supervisor.start()
+        commands.register(server, _supervisor)
+        # help 列表里的说明交给 MCDR 按它自己的语言挑（不点插件界面的语言）；
+        # 权限传 PERM_ADMIN：`!!ig` 全部命令都只给管理员用，所以不该出现在普通玩家的 !!help 里
+        server.register_help_message('!!ig', {
+            'zh_cn': i18n.translate('command.help.mcdr', 'zh_cn'),
+            'en_us': i18n.translate('command.help.mcdr', 'en_us'),
+        }, permission=commands.PERM_ADMIN)
+    except Exception:
+        server.logger.error('Idle Guard 初始化失败，正在清理已启动的后台线程', exc_info=True)
+        try:
+            _supervisor.shutdown()
+        except Exception:  # noqa: BLE001 - 清理阶段的异常不能盖住原始错误
+            server.logger.warning('清理失败的实例时又出错了', exc_info=True)
+        _supervisor = None
+        raise
     server.logger.info(f'Idle Guard v{PLUGIN_VERSION} 已加载（界面语言 {_supervisor.language}，'
                        f'每 {int(config.check_interval)} 秒侦察一次，'
                        f'无人 {int(config.idle_timeout // 60)} 分钟后休眠）')

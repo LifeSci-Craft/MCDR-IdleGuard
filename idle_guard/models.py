@@ -8,9 +8,9 @@ from __future__ import annotations
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .config import ServerEntry
 from .fakeserver import FakeServer
@@ -198,6 +198,12 @@ class ServerView:
         view.locked = bool(data.get('locked', False))
         view.auto_sleep = bool(data.get('auto_sleep', True))
         view.always_on = bool(data.get('always_on', False))
+        # 对端发来的字段不能全信（可能是旧版本、也可能被人改过）：枚举值不合法就降级。
+        # 以前 role/state 原样收下 —— 一个未知 state 会直接进状态表与 _precheck_action 的判断。
+        if view.role not in ('self', 'command', 'watch'):
+            view.role = 'watch'
+        if view.state not in {item.value for item in State}:
+            view.state = State.UNKNOWN.value
         view.instance = instance
         return view
 

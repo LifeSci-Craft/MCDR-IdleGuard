@@ -9,9 +9,8 @@
 """
 from __future__ import annotations
 
-import threading
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 from .models import ServerView, State
 
@@ -113,10 +112,12 @@ class RemoteMixin:
         # ⚠️ 必须排除自己：否则本实例会先回一句"本实例不负责 X"，
         # 而远端真正执行休眠/唤醒要几十秒、早就超过总线超时了 —— 于是那句误报会盖掉真正的结果
         # （线上真实踩到：`!!ig sleep Creative` 明明生效了，却回"本实例不负责 Creative"）。
-        replies = [reply for reply in
-                   (self._bus.send(address, {'type': 'action', 'action': action, 'server': server, 'by': by})
-                    for address in self._peer_addresses())
-                   if reply]
+        # 用 broadcast 并行发起：以前是逐个 send 的串行循环，对端越多、管理员等得越久
+        # （每个不可达对端都把超时等满），而且同一个地址还可能因为两次取列表而不同。
+        addresses = self._peer_addresses()
+        replies = self._bus.broadcast(
+            addresses, {'type': 'action', 'action': action, 'server': server, 'by': by},
+        )
         accepted = next((reply for reply in replies if reply.get('ok')), None)
         if accepted is not None:
             detail = str(accepted.get('reason') or self.tr('action.accepted'))
@@ -128,7 +129,7 @@ class RemoteMixin:
             return False, str(replies[0].get('reason') or self.tr('action.failed'))
 
         # 一个应答都没有：负责它的实例不在线，或者这条没配总线地址
-        addresses = self._peer_addresses()
+        # （addresses 直接复用上面那份：以前这里又取了一次，两次结果理论上可以不同）
         entry = next((e for e in self._config.servers if e.name == server), None)
         role = entry.role if entry is not None else 'watch'
         # 提示要说对病因：role 已经是 auto 时，再劝人"把 role 改成 auto"是废话

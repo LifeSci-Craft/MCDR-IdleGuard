@@ -14,7 +14,7 @@ from idle_guard import commands as cmd_mod
 from idle_guard import diag as diag_mod
 from idle_guard.config import AnnounceConfig, BusConfig, Config, FakeServerConfig, ServerEntry
 from idle_guard.mcproto import PingResult
-from idle_guard.supervisor import ServerView, State, Supervisor
+from idle_guard.supervisor import State, Supervisor
 from mc_test_utils import StubMCDR, free_port, wait_until
 
 

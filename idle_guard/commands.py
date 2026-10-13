@@ -483,12 +483,18 @@ def _cmd_status(source: CommandSource, supervisor: Supervisor, prefix: str = '!!
     tr = supervisor.tr
     chat = _is_chat(source)
     views = supervisor.status_views()
-    numbers = server_numbers(supervisor)
-    names = [name for name in server_names(supervisor) if name in views] or list(views)
+    # 编号必须与 `resolve_server` 的解析口径一致（都是"配置顺序的第 N 条"）。
+    # 以前这里是 `numbers.get(name, index)`，而名字→编号的映射在**配置里出现重名**时
+    # 只留最后一个 —— 于是状态表第 1 行的开关点下去，实际操作的是第 2 条。
+    # 现在直接按渲染顺序带上配置序号，渲染与执行同源。
+    ordered = [(number, name) for number, name in enumerate(server_names(supervisor), start=1)
+               if name in views]
+    if not ordered:
+        ordered = list(enumerate(views, start=1))
 
     rows = [_status_header(tr, prefix)]
-    rows.extend(status_cells(views[name], numbers.get(name, index), tr, prefix, chat)
-                for index, name in enumerate(names, start=1))
+    rows.extend(status_cells(views[name], number, tr, prefix, chat)
+                for number, name in ordered)
     _screen(source, supervisor, _table(rows, chat=chat), tr('command.screen.status_hint'))
 
 
@@ -547,6 +553,15 @@ def _precheck_action(source: CommandSource, supervisor: Supervisor, action: str,
     view = views.get(name)
     if view is None or name not in live:
         return True
+    # ⚠️ 只有「本实例自己负责」的子服才允许拿这份状态去**拦**操作。
+    # 别人的子服用的是心跳缓存（最快也要一个 state_tick 才更新一次），而状态变化可能
+    # 就发生在最近一秒 —— 拿它拦会真的把该执行的操作挡掉。端到端实测踩到过：
+    # survival 刚休眠 1 秒，lobby 侧的 `!!ig wake survival` 被旧快照判成「已经开着了」，
+    # 于是唤醒请求根本没发出去，玩家只能对着休眠中的服干等。
+    # 远端一律放行：由**负责那台服的实例**用它自己的权威状态判断并回话
+    # （它可能回"已经开着了"，也可能回"还有 N 名玩家在线"——那都是准确答案）。
+    if not view.local:
+        return True
     message = _precheck_message(action, view.state, view, supervisor.tr, name)
     if message is None:
         return True
@@ -559,11 +574,16 @@ def _run_action(source: CommandSource, supervisor: Supervisor, action: str,
                 name: str, by: str) -> None:
     """把 sleep / wake 丢到后台线程执行（回调里不能阻塞几十秒）。"""
     tr = supervisor.tr
-    if action == 'sleep':
-        _notice(source, tr('command.action.sleep_running', server=name), RColor.gray)
-    else:
-        _notice(source, tr('command.action.wake_running', server=name,
-                           eta=int(supervisor.eta_of(name))), RColor.gray)
+    # 先说一句"正在启动/正在休眠"，让管理员知道要等一会儿 —— 但**只在本地负责的子服上说**。
+    # 远端的状态可能比真实滞后一两秒，先说"正在启动"会立刻被真相反驳
+    # （实测：对已经开着的服发 wake，先收到"正在启动…"、随后才是"已经开着了"）。
+    # 远端就让负责那台实例的回复作为第一句话。
+    if supervisor.state_of(name) is not None:
+        if action == 'sleep':
+            _notice(source, tr('command.action.sleep_running', server=name), RColor.gray)
+        else:
+            _notice(source, tr('command.action.wake_running', server=name,
+                               eta=int(supervisor.eta_of(name))), RColor.gray)
 
     def worker() -> None:
         ok, detail = supervisor.request_action(action, name, by=by, wait=True)
@@ -604,7 +624,6 @@ def _cmd_action(source: CommandSource, supervisor: Supervisor, action: str, toke
         return
     name = resolve_server(supervisor, token) or token
     by = _source_name(source, supervisor)
-    tr = supervisor.tr
 
     if action in ('lock', 'unlock'):
         ok, detail = supervisor.request_action(action, name, by=by)

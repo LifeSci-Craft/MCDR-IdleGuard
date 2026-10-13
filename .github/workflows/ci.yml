@@ -46,3 +46,64 @@ jobs:
           name: idle_guard-mcdr
           path: idle_guard-*.mcdr
           if-no-files-found: error
+
+  lint:
+    name: 静态检查（ruff）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: 安装 ruff
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'ruff~=0.17'
+      - name: ruff check（规则集见仓库根 ruff.toml：E9 + F）
+        run: python -m ruff check .
+
+  mcdr-floor:
+    name: 最低支持的 MCDR（2.13.0）与压测 smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      # ⚠️ 这一层必须**钉死到下限**。以前装的是 'mcdreforged>=2.13,<3'（实际解析到最新版），
+      # 于是插件声明的最低版本从来没有被跑过 —— 而 mcdreforged.plugin.json 里
+      # dependencies 写的正是 >=2.13.0，声明与验证对不上。
+      - name: 安装最低支持的 MCDR
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest 'mcdreforged==2.13.0'
+      - name: 在最低版本上跑单元 / 集成测试
+        run: python -m pytest tests/ -q
+      - name: 压测工具 smoke（工具本身也得有人跑，否则会像 1.1.0 那样悄悄坏掉）
+        run: python tools/soak.py --rounds 20
+
+  mcdr-matrix:
+    name: 跨 MCDR 版本测试（${{ matrix.mcdr }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 最低 + 若干中间 + 最新。tools/mcdr_matrix.py 里的 MIN_MCDR 由
+        # mcdreforged.plugin.json 的 dependencies 解析得到，不再各写一份。
+        mcdr: ['2.13.0', '2.14.1', '2.15.0', '2.15.7', '2.16.0']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: 安装 MCDR ${{ matrix.mcdr }} 与 pytest
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest 'mcdreforged==${{ matrix.mcdr }}'
+      - name: 跑测试套件
+        run: python -m pytest tests/ -q
+
+# 说明：mcdr-matrix 这一层是「每个 MCDR 版本都能导入、并跑通测试套件」的 CI 级矩阵。
+# 发版前那一轮仍然按项目规矩跑 `python tools/mcdr_matrix.py`
+# （起真实 MCDR、逐项核对命令树与输出），它依赖本机的多版本解释器，
+# 不放在这里假装成 CI 覆盖。

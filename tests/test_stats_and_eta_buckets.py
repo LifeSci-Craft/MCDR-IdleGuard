@@ -1,7 +1,6 @@
 """冷 / 热启动的 ETA 分桶，以及 `!!ig stats` 的累计统计。"""
 from __future__ import annotations
 
-import json
 import time
 
 import pytest
@@ -10,8 +9,8 @@ from idle_guard import commands as cmd_mod
 from idle_guard import stats as stats_mod
 from idle_guard.config import AnnounceConfig, BusConfig, Config, FakeServerConfig, ServerEntry
 from idle_guard.mcproto import PingResult
-from idle_guard.supervisor import State, Supervisor
-from mc_test_utils import StubMCDR, free_port, wait_until
+from idle_guard.supervisor import Supervisor
+from mc_test_utils import StubMCDR, free_port
 
 
 class Source:
