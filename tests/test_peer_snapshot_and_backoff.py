@@ -2,10 +2,11 @@
 
 两条都来自代码审查：
 
-1. **读命令的快照改为"用心跳缓存"**：心跳每 `state_tick` 秒已经在后台问过对端状态并拿回了完整快照
+1. **读命令只读心跳缓存**：心跳每 `state_tick` 秒已经在后台问过对端状态并拿回了完整快照
    （以前直接丢掉），于是 `!!ig status/diag/check` 渲染时要在 **MCDR 的命令线程上**再同步问一遍 ——
    每个对端最多等 2 秒，对端被防火墙丢包时能把命令线程卡到十几秒（MCDR 会报 TaskExecutor 无响应）。
-   `live_views()` 现在优先用缓存，只为"完全没有缓存"的地址现场问一次。
+   `live_views()` 现在**只用缓存**：没有新鲜缓存就当作"这一轮没有数据"（该行退回本地旧快照、
+   标记为不可信），探测一律交给后台心跳。把 `state_tick` 设为 0 时也**不会**退化成同步等待。
 2. **侦察失败要按整轮间隔退避**：`next_full` 以前只在 `poll_once()` 正常返回后推进，
    持续失败时就会每一轮（默认 5 秒）重试并打一条带堆栈的错误日志。
 """
@@ -13,10 +14,7 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
 from idle_guard.config import AnnounceConfig, BusConfig, Config, FakeServerConfig, ServerEntry
-from idle_guard.mcproto import PingResult
 from idle_guard.supervisor import State, Supervisor
 from mc_test_utils import StubMCDR, free_port
 
@@ -106,27 +104,28 @@ def test_an_unreachable_peer_is_remembered_so_the_read_path_never_waits():
         supervisor.shutdown()
 
 
-def test_nothing_cached_yet_falls_back_to_one_probe():
-    """完全没缓存（插件刚起来 / 关掉了心跳）时才现场问一次。"""
+def test_no_cache_means_no_network_on_the_read_path():
+    """完全没有缓存（插件刚起来 / 关掉了心跳）时**也不许**在命令线程上等网络。
+
+    这里刻意把 state_tick 设成 0（配置里明确支持"关掉心跳"）：这时缓存永远不会新鲜，
+    旧实现会因此**每次**读命令都现场广播一次 —— 对端被防火墙丢包时每个地址等满约 2 秒，
+    几个死对端就能让 MCDR 报「TaskExecutor 10 秒无响应」。
+    现在的契约：没有新鲜缓存就当作"这一轮没有数据"，退回本地旧快照并标记为不可信。
+    """
     supervisor, _stub = build(state_tick=0)
     try:
         calls: list = []
-
-        def fake_broadcast(addresses, message, timeout=None):
-            calls.append(list(addresses))
-            return [peer_reply()]
-
-        supervisor._bus.broadcast = fake_broadcast
+        supervisor._bus.broadcast = lambda *a, **k: calls.append(a) or [peer_reply()]
         views, live = supervisor.live_views()
-        assert calls == [[PEER_ADDRESS]], calls
-        assert views['Creative'].state == State.SLEEPING.value
-        assert 'Creative' in live
+        assert calls == [], '读路径不允许发起同步探测（探测是心跳的活）'
+        assert 'Creative' not in live, '没有缓存时它的数据不算可信'
+        assert views['Creative'].state != State.SLEEPING.value
     finally:
         supervisor.shutdown()
 
 
-def test_a_stale_cache_is_refreshed_instead_of_being_trusted():
-    """缓存过期（心跳停了 / 对端很久没应答）就退回现场探测，不能一直拿旧数据当真。"""
+def test_a_stale_cache_is_not_trusted_nor_refreshed_by_the_read_path():
+    """过期的缓存既不当真、也不在读路径上刷新 —— 刷新交给心跳。"""
     supervisor, _stub = build()
     try:
         supervisor._peer_snapshots[PEER_ADDRESS] = {
@@ -136,9 +135,11 @@ def test_a_stale_cache_is_refreshed_instead_of_being_trusted():
         calls: list = []
         supervisor._bus.broadcast = (lambda addresses, message, timeout=None:
                                      (calls.append(list(addresses)), [peer_reply(State.RUNNING.value)])[1])
-        views, _live = supervisor.live_views()
-        assert calls == [[PEER_ADDRESS]], '过期缓存应当被现场探测替换'
-        assert views['Creative'].state == State.RUNNING.value
+        views, live = supervisor.live_views()
+        assert calls == [], '过期缓存不该在读路径上被同步替换'
+        assert 'Creative' not in live, '过期数据不算可信'
+        # 退回本地那份快照（这里本地没有对应条目，因此是 watch/unknown 的默认视图）
+        assert views['Creative'].state != State.SLEEPING.value
     finally:
         supervisor.shutdown()
 
