@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from typing import Dict, Optional, Tuple
 
@@ -22,6 +23,8 @@ class Stats:
         self._servers: Dict[str, Dict[str, float]] = {}
         #: 内存里记"当前这次休眠从什么时候开始"，唤醒时结算成 sleep_seconds
         self._sleeping_since: Dict[str, float] = {}
+        #: 串行化 save()：休眠动作线程与轮询线程都可能调它（以前无锁，可能互相截断）
+        self._lock = threading.RLock()
         self._load()
 
     # ------------------------------------------------------------------ 读写
@@ -32,6 +35,9 @@ class Stats:
             with open(self._path, encoding='utf-8') as handle:
                 data = json.load(handle)
         except Exception:  # noqa: BLE001 - 统计文件坏了不该影响插件运行
+            # 损坏的文件先挪到一边：以前是直接忽略，于是下一次 save() 会把
+            # "也许还能人工抢救"的内容覆盖掉，而且不留任何痕迹说明它坏过。
+            self._quarantine()
             return
         if not isinstance(data, dict):
             return
@@ -49,15 +55,33 @@ class Stats:
                     'sleep_seconds': _number(values.get('sleep_seconds')),
                 }
 
-    def save(self) -> None:
+    def _quarantine(self) -> None:
+        """把读不动的统计文件改名留证（`stats.json.corrupt`），绝不阻断插件运行。"""
         if not self._path:
             return
         try:
-            with open(self._path, 'w', encoding='utf-8') as handle:
-                json.dump({'since': self._since, 'servers': self._servers},
-                          handle, ensure_ascii=False, indent=2)
-        except Exception:  # noqa: BLE001
+            os.replace(self._path, f'{self._path}.corrupt')
+        except OSError:
             pass
+
+    def save(self) -> None:
+        """原子写盘：先写临时文件再 `os.replace` 整份替换。
+
+        以前是直接 `'w'` 截断写 —— 崩溃/断电正好落在写入中途就留下半个 JSON，
+        而 load 端读不动就**整份丢弃**（这个文件里有累计休眠时长，丢了等于历史清零）；
+        两个线程同时 save 还会互相截断。现在最坏情况只是"这一次的计数没写进去"。
+        """
+        if not self._path:
+            return
+        with self._lock:
+            try:
+                payload = {'since': self._since, 'servers': self._servers}
+                tmp_path = f'{self._path}.tmp'
+                with open(tmp_path, 'w', encoding='utf-8') as handle:
+                    json.dump(payload, handle, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, self._path)
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------ 计数
     def _entry(self, name: str) -> Dict[str, float]:

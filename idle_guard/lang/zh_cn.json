@@ -159,7 +159,6 @@
   "action.sleep_has_players": "{server} 还有 {count} 名玩家在线（{players}），不能休眠 —— 等他们离开后没人了才会自动休眠",
   "action.sleep_has_players_anon": "{server} 还有 {count} 名玩家在线（服务端没公开名单），不能休眠",
   "action.sleep_unknown_players": "无法确认 {server} 上是否有人在（{detail}），为安全起见不休眠",
-  "command.status.hint_players": "有玩家的子服不会被休眠（手动指令也会被拒绝）",
   "command.action.busy": "{server} 正在{state}，等它变完再试",
   "command.action.sleep_has_players": "{server} 还有 {count} 名玩家在线，不能休眠 —— 等没人了它会自己休眠",
   "hover.col_state": "悬停状态看说明与空闲计时",

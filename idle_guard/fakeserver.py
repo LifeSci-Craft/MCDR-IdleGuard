@@ -45,6 +45,22 @@ from .mcproto import (
 #: 所以它只在被扫时才起作用。不做成配置项：它没有需要按机器区分的场景。
 MAX_CONNECTIONS = 64
 
+#: 单个来源 IP 的连接数上限：一台机器不该把上面的名额全占掉（真人玩家、代理、探测各占一两条）。
+MAX_CONNECTIONS_PER_IP = 16
+
+#: 名额用满之后仍然"多收"几条连接的名额。
+#: 为什么还要多收：真实玩家撞上满员时，如果只是被关掉，他**既看不到提示、也触发不了唤醒**
+#: （而"一连就能唤醒"正是这个插件的全部价值）。所以再放几条进来做**短预算**处理：
+#: 读握手的超时缩到 1 秒、发完断开包立刻关，只为了让玩家收到那句话并把唤醒发出去。
+#: 用完之后一律走"只记一次尝试 + 记日志 + 关连接"的轻路径，不再开线程。
+OVERFLOW_CONNECTIONS = 16
+
+#: 名额用满时，读握手的超时（秒）。正常是 read_timeout（5 秒）。
+OVERFLOW_READ_TIMEOUT = 1.0
+
+#: 连接数超限的告警最短间隔（秒）：被扫时不能每来一条连接就写一行日志。
+OVERFLOW_WARN_INTERVAL = 10.0
+
 
 class FakeServer:
     def __init__(
@@ -58,6 +74,7 @@ class FakeServer:
         read_timeout: float = 5.0,
         linger_timeout: float = 2.0,
         max_connections: int = MAX_CONNECTIONS,
+        max_connections_per_ip: int = MAX_CONNECTIONS_PER_IP,
     ):
         self._bind_host = bind_host
         self._port = int(port)
@@ -68,8 +85,15 @@ class FakeServer:
         self._read_timeout = read_timeout
         self._linger_timeout = linger_timeout
         self._max_connections = max(1, int(max_connections))
-        #: 当前正在处理的连接数（受 _max_connections 限制）
+        self._max_connections_per_ip = max(1, int(max_connections_per_ip))
+        self._overflow_slots = OVERFLOW_CONNECTIONS
+        self._overflow_read_timeout = OVERFLOW_READ_TIMEOUT
+        #: 当前正在处理的连接数（正常名额 + 溢出名额）
         self._active = 0
+        #: 每个来源 IP 当前占用的连接数
+        self._active_by_ip: dict = {}
+        #: 上一次"连接数超限"告警的时刻（monotonic）
+        self._overflow_warn_at = 0.0
 
         self._lock = threading.RLock()
         self._sock: Optional[socket.socket] = None
@@ -115,7 +139,9 @@ class FakeServer:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 sock.bind((self._bind_host, self._port))
-                sock.listen(32)
+                # backlog 必须 ≥ 并发上限，否则突发时先撞 backlog：玩家看到的是"连接超时"，
+                # 而不是被我们限流（后者至少有日志、有提示，好排查）
+                sock.listen(max(64, (self._max_connections + self._overflow_slots) * 2))
             except OSError as exc:
                 self._last_error = f'{type(exc).__name__}: {exc}'
                 sock.close()
@@ -172,32 +198,87 @@ class FakeServer:
                 time.sleep(1.0)
                 continue
 
+            peer = f'{addr[0]}:{addr[1]}'
+            # 接受成功即清掉上一次的接受错误：这个字段的语义是"最近一次仍未恢复的问题"，
+            # 留着几小时前的一次抖动会把 !!ig diag 的读者带偏
             with self._lock:
-                room = self._active < self._max_connections
-                if room:
-                    self._active += 1
-            if not room:
-                # 并发上限：这是**对外的游戏端口**，不限个数的话几百个"连上不发数据"的连接
-                # 就能把线程与句柄堆满；句柄一满还会把上面的 accept 打挂（EMFILE）。
-                self._logger.debug(f'假服务端并发连接已达上限 {self._max_connections}，'
-                                   f'丢弃来自 {addr[0]} 的连接')
+                self._last_error = ''
+                slot = self._acquire_locked(addr[0])
+            if not slot:
+                # 名额用尽：仍然是"有人在连"，所以**不能**把这次尝试悄悄丢掉 ——
+                # 记一次登录尝试（玩家照样能唤醒服务端）、记一条限流日志，再关掉连接。
+                self._warn_overflow(peer)
+                self._note_login_attempt(None, peer)
                 self._close_quietly(conn)
                 continue
+            if slot == 'overflow':
+                self._warn_overflow(peer)
 
             threading.Thread(
                 target=self._serve_connection,
-                args=(conn, f'{addr[0]}:{addr[1]}'),
+                args=(conn, peer, slot == 'overflow'),
                 name=f'IdleGuard-FakeConn-{self._port}',
                 daemon=True,
             ).start()
 
-    def _serve_connection(self, conn: socket.socket, peer: str) -> None:
-        """跑完一条连接，并把并发计数还回去（计数在 `_accept_loop` 里加）。"""
+    # ------------------------------------------------------------------ 并发名额
+
+    def _acquire_locked(self, ip: str) -> str:
+        """占一个连接名额，返回 'normal' / 'overflow' / ''（已用尽）。调用方需持有 self._lock。"""
+        if self._active_by_ip.get(ip, 0) >= self._max_connections_per_ip:
+            return ''
+        if self._active < self._max_connections:
+            slot = 'normal'
+        elif self._active < self._max_connections + self._overflow_slots:
+            slot = 'overflow'
+        else:
+            return ''
+        self._active += 1
+        self._active_by_ip[ip] = self._active_by_ip.get(ip, 0) + 1
+        return slot
+
+    def _release(self, ip: str) -> None:
+        with self._lock:
+            self._active = max(0, self._active - 1)
+            rest = self._active_by_ip.get(ip, 0) - 1
+            if rest > 0:
+                self._active_by_ip[ip] = rest
+            else:
+                self._active_by_ip.pop(ip, None)
+
+    def _warn_overflow(self, peer: str) -> None:
+        """连接数超限的告警（最短间隔 OVERFLOW_WARN_INTERVAL，免得被灌时刷爆日志）。"""
+        now = time.monotonic()
+        with self._lock:
+            if now - self._overflow_warn_at < OVERFLOW_WARN_INTERVAL:
+                return
+            self._overflow_warn_at = now
+            active = self._active
+        self._logger.warning(
+            f'假服务端连接数已达上限（正常 {self._max_connections} 条 + 溢出 {self._overflow_slots} 条，'
+            f'每 IP {self._max_connections_per_ip} 条）：{peer} 的连接被限流，当前 {active} 条。'
+            f'玩家此刻可能收不到提示 —— 若反复出现，检查有没有客户端在反复重连'
+        )
+
+    def _note_login_attempt(self, player: Optional[str], peer: str) -> None:
+        """记一次连接尝试并通知上层（正常路径与限流路径共用，保证唤醒语义不丢）。"""
+        self.login_attempt_count += 1
         try:
-            self._handle(conn, peer)
+            self._on_login_attempt(player, peer)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.error(f'处理登录尝试回调时出错: {type(exc).__name__}: {exc}')
+
+    def _serve_connection(self, conn: socket.socket, peer: str, short: bool = False) -> None:
+        """跑完一条连接，并把并发计数还回去（计数在 `_accept_loop` 里加）。
+
+        ``short=True`` 表示这是"溢出名额"里的连接：只给很短的处理预算，
+        目的是让玩家尽快收到提示、并让唤醒照常发出去。
+        """
+        ip = peer.rsplit(':', 1)[0]
+        try:
+            self._handle(conn, peer, short=short)
         finally:
-            with self._lock:
-                self._active = max(0, self._active - 1)
+            self._release(ip)
 
     @staticmethod
     def _close_quietly(conn: socket.socket) -> None:
@@ -206,9 +287,12 @@ class FakeServer:
         except OSError:
             pass
 
-    def _handle(self, conn: socket.socket, peer: str) -> None:
+    def _handle(self, conn: socket.socket, peer: str, short: bool = False) -> None:
         try:
-            conn.settimeout(self._read_timeout)
+            # settimeout 同时管住收和发（Python 没有单独的写超时），所以一条连接的
+            # 预算 = 读握手 + 发包 + 等对端关闭，都不会无限期挂着。
+            # short=True（溢出名额）时把读超时压到 1 秒，别让"连上不说话"的连接长期占位。
+            conn.settimeout(self._overflow_read_timeout if short else self._read_timeout)
             reader = ConnReader(conn)
             if reader.peek(1)[:1] == b'\xfe':
                 self._handle_legacy(conn)
@@ -226,7 +310,7 @@ class FakeServer:
             if next_state == HANDSHAKE_NEXT_STATE_STATUS:
                 self._handle_status(conn, reader, protocol)
             elif next_state == HANDSHAKE_NEXT_STATE_LOGIN:
-                self._handle_login(conn, reader, peer)
+                self._handle_login(conn, reader, peer, short=short)
         except (OSError, ValueError, ConnectionError):
             pass
         except Exception as exc:  # noqa: BLE001 - 假服务端不能因为单个连接异常而崩溃
@@ -248,7 +332,8 @@ class FakeServer:
         except (OSError, ValueError, ConnectionError):
             pass
 
-    def _handle_login(self, conn: socket.socket, reader: ConnReader, peer: str) -> None:
+    def _handle_login(self, conn: socket.socket, reader: ConnReader, peer: str,
+                      short: bool = False) -> None:
         player_name: Optional[str] = None
         try:
             packet_id, payload = reader.read_packet()
@@ -258,16 +343,15 @@ class FakeServer:
         except (OSError, ValueError, ConnectionError):
             player_name = None
 
-        self.login_attempt_count += 1
-        try:
-            self._on_login_attempt(player_name, peer)
-        except Exception as exc:  # noqa: BLE001
-            self._logger.error(f'处理登录尝试回调时出错: {type(exc).__name__}: {exc}')
+        self._note_login_attempt(player_name, peer)
 
         kick_text = self._kick_factory()
         reason = json.dumps({'text': kick_text}, ensure_ascii=False)
         try:
             conn.sendall(pack_packet(0x00, encode_string(reason)))
+            if short:
+                # 溢出名额：发完就走，不等对端关闭（这类连接的存在本身就是压力）
+                return
             # 等待对端先关闭，避免本机侧产生 TIME_WAIT 残留
             conn.settimeout(self._linger_timeout)
             while True:

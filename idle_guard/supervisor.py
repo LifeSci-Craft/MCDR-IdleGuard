@@ -26,8 +26,6 @@ import subprocess
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
-from enum import Enum
 from typing import Deque, Dict, List, Optional, Set, Tuple
 
 from mcdreforged.api.types import PluginServerInterface
@@ -36,7 +34,6 @@ from . import i18n
 from . import velocity as velocity_module
 from .bus import Bus, parse_address
 from .config import FAKE_SERVER_BIND, LEGACY_BUS_TOKEN, Config, ServerEntry
-from .fakeserver import FakeServer
 from .mcproto import PingResult, bind_error, port_open, status_ping
 from .remote import RemoteMixin
 from .takeover import TakeoverMixin
@@ -55,6 +52,13 @@ _STARTUP_STATS_FILE = 'startup_seconds.json'
 #: 每个子服最多留多少个启动耗时样本（ETA 取这些样本的中位数）
 _STARTUP_SAMPLES_MAX = 8
 
+#: shutdown 时等轮询线程收尾的上限（秒）。
+#: 一轮侦察最坏能到十几秒（多个不可达目标各自等满超时；`_ping_all` 的 as_completed 上限是 15 秒），
+#: 而 shutdown 之后旧线程仍在跑的话，它还会去 `_ensure_fake_server` 把端口抢回来 ——
+#: 表现成"插件已经卸下了，端口上却还挂着假服务端"。所以这里给足时间；
+#: 真超时的那些由 `_ensure_fake_server` 入口处的 `_stopping` 守卫收手。
+_POLL_JOIN_TIMEOUT = 20.0
+
 
 def _median(values: List[float]) -> float:
     """中位数（不动入参）。"""
@@ -63,6 +67,45 @@ def _median(values: List[float]) -> float:
     if len(ordered) % 2:
         return ordered[mid]
     return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def token_fingerprint(token: Optional[str]) -> str:
+    """总线口令的短指纹（8 位十六进制；空口令返回空串）。
+
+    口令本身不该出现在日志、截图或贴出来的排错文本里，但多实例排障时需要"能一眼看出
+    两边口令是否一致"（口令不一致与"那台实例没运行"表现完全一样，都是连不上）。
+    抽成模块级函数是为了让 `__init__.py` 在 Supervisor 还没建起来时（首次生成配置那一刻）
+    也能印同一个指纹，而不必复制这段算法。
+    """
+    text = token or ''
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()[:8] if text else ''
+
+
+def _read_json_object(path: str) -> dict:
+    """读一个 JSON 对象；文件不存在或不是对象时返回空 dict（调用方只需拿到"旧内容"）。"""
+    try:
+        with open(path, encoding='utf-8') as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _merge_unknown_keys(old: dict, new: dict) -> dict:
+    """把旧配置里**本插件不认识**的键合并回新内容（重写配置文件时不能把它们丢掉）。
+
+    背景：MCDR 的 `Serializable` 只认 dataclass 上声明过的字段，所以用户自己加的键
+    （或旧版本留下、现已删除的字段）在 `serialize()` 时就没了。而 `_save_config()`
+    是**整份覆盖**，且会在从 velocity.toml 自动补子服时被触发 —— 不加这一步，
+    用户手写进 config.json 的东西会在某次重启后静默消失。
+    """
+    for key, value in old.items():
+        if key not in new:
+            new[key] = value
+        elif isinstance(value, dict) and isinstance(new[key], dict):
+            for sub_key, sub_value in value.items():
+                new[key].setdefault(sub_key, sub_value)
+    return new
 
 
 class Supervisor(TakeoverMixin, RemoteMixin):
@@ -77,6 +120,11 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         self._language = self._resolve_language()
         self._stopping = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
+        #: 状态探测用的**常驻**线程池。以前每个心跳周期都 `with ThreadPoolExecutor(...)`
+        #: 新建一个：默认 state_tick=5 秒，等于每天上万次线程创建/销毁，每个探测连接还会
+        #: 留下一批 TIME_WAIT。只在轮询线程里提交任务，shutdown 时统一关掉。
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix='IdleGuard-Ping')
 
         self._managed: Dict[str, ManagedServer] = {}
         self._views: Dict[str, ServerView] = {}      # 所有子服（含只监视的）最新快照
@@ -207,8 +255,7 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         给多实例对照用：口令本身不必印出来，但两边对不上时要能一眼看出是"口令不一致"
         而不是"那台实例没运行"（这两种的表现都是连不上，很难分）。
         """
-        token = self._config.bus.token or ''
-        return hashlib.sha256(token.encode('utf-8')).hexdigest()[:8] if token else ''
+        return token_fingerprint(self._config.bus.token)
 
     def config_warnings(self) -> List[str]:
         """配置自检：返回一串「能一眼看懂、能直接照做」的问题说明（没问题就是空列表）。
@@ -359,8 +406,10 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         self._stopping.set()
         thread = self._poll_thread
         if thread is not None and thread.is_alive():
-            thread.join(timeout=3.0)
+            thread.join(timeout=_POLL_JOIN_TIMEOUT)
         self._poll_thread = None
+        # 常驻探测池：不再接收新任务，也不等已在跑的那几个（它们最长 3 秒就自己结束）
+        self._pool.shutdown(wait=False)
         for managed in self._managed.values():
             if managed.fake is not None:
                 managed.fake.stop()
@@ -451,13 +500,19 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         self._save_config()
 
     def _save_config(self) -> None:
-        """把当前配置写回 config.json（自动补过子服时用，好让管理员看得见改动）。"""
+        """把当前配置写回 config.json（自动补过子服时用，好让管理员看得见改动）。
+
+        ⚠️ 这是**整份覆盖**，所以必须先把文件里本插件不认识的键捞出来原样带回
+        （见 `_merge_unknown_keys`）：MCDR 的 Serializable 只认声明过的字段，
+        用户手写进去的键会在重写时被静默丢掉 —— 而重写是自动发生的。
+        """
         if self._data_dir is None:
             return
         path = os.path.join(self._data_dir, 'config.json')
         try:
+            payload = _merge_unknown_keys(_read_json_object(path), self._config.serialize())
             with open(path, 'w', encoding='utf-8') as handle:
-                json.dump(self._config.serialize(), handle, ensure_ascii=False, indent=4)
+                json.dump(payload, handle, ensure_ascii=False, indent=4)
         except Exception as exc:  # noqa: BLE001
             self._logger.warning(f'配置写回失败（不影响本次运行）：{type(exc).__name__}: {exc}')
 
@@ -623,14 +678,13 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             return
 
         results: Dict[str, PingResult] = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
-            futures = {pool.submit(status_ping, e.host, e.port, 1.0): e for e in targets}
-            for future in concurrent.futures.as_completed(futures):
-                entry = futures[future]
-                try:
-                    results[entry.name] = future.result()
-                except Exception as exc:  # noqa: BLE001
-                    self._logger.debug(f'心跳查询 {entry.name} 失败：{type(exc).__name__}: {exc}')
+        futures = {self._pool.submit(status_ping, e.host, e.port, 1.0): e for e in targets}
+        for future in concurrent.futures.as_completed(futures):
+            entry = futures[future]
+            try:
+                results[entry.name] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                self._logger.debug(f'心跳查询 {entry.name} 失败：{type(exc).__name__}: {exc}')
 
         for managed_server in managed:
             ping = results.get(managed_server.name)
@@ -670,17 +724,16 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         results: Dict[str, PingResult] = {}
         if not entries:
             return results
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(entries))) as pool:
-            futures = {
-                pool.submit(status_ping, e.host, e.port, 3.0): e
-                for e in entries
-            }
-            for future in concurrent.futures.as_completed(futures, timeout=15.0):
-                entry = futures[future]
-                try:
-                    results[entry.name] = future.result()
-                except Exception as exc:  # noqa: BLE001
-                    results[entry.name] = PingResult(online=False, error=f'{type(exc).__name__}: {exc}')
+        futures = {
+            self._pool.submit(status_ping, e.host, e.port, 3.0): e
+            for e in entries
+        }
+        for future in concurrent.futures.as_completed(futures, timeout=15.0):
+            entry = futures[future]
+            try:
+                results[entry.name] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                results[entry.name] = PingResult(online=False, error=f'{type(exc).__name__}: {exc}')
         return results
 
     def _build_view(self, entry: ServerEntry, ping: Optional[PingResult]) -> ServerView:
@@ -1334,6 +1387,11 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         """
         detail = self.tr(detail_key, **args) if detail_key else str(args.get('detail') or '')
         managed.wake_failures += 1
+        # 这次尝试已经结束（而且失败了），把冷却时间戳清掉：否则接下来 wake_cooldown
+        # （默认 15 秒）里玩家再连进来会被挡下，还会收到一句与事实不符的「正在启动中」
+        # —— 状态其实已经被放回"未运行"。重试风暴由 action_lock 串行化 + 连续失败
+        # max_wake_failures 次之后的自动锁定兜住，不需要靠这条冷却。
+        managed.last_wake_ts = 0.0
         self._logger.error(f'{managed.name} 唤醒失败（第 {managed.wake_failures} 次）：{detail}')
         self._set_state(managed, State.OFFLINE, detail)
         self._ensure_fake_server(managed, retry=True)
@@ -1616,6 +1674,16 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                 view = ServerView.from_dict(data, instance=instance)
                 target = merged.get(view.name)
                 if view.role in MANAGED_ROLES:
+                    known = self._owner_name.get(view.name, '')
+                    if known and instance and known != instance:
+                        # 同一个子服被两台实例同时认领：只信最先报上来的那台。
+                        # 共享同一口令的对端（或同一份配置多开的副本）不该能把归属抢走 ——
+                        # 抢走的后果是本实例以为"这台不归我管"，于是拒绝休眠/唤醒它，
+                        # 状态表还会把管理员指向错误的机器。
+                        self._logger.warning(
+                            f'{view.name} 被 @{known} 与 @{instance} 同时认领，保留 @{known}（忽略后者）'
+                        )
+                        continue
                     # 对方说"我在管它" —— 它才是权威，整份采用
                     view.local = False
                     merged[view.name] = view
@@ -1651,7 +1719,9 @@ class Supervisor(TakeoverMixin, RemoteMixin):
 
     def _mark_peer_alive(self, instance: str) -> None:
         """刚跟这台实例通过话（用于 live_views 这种临时查询的结果）。"""
-        for health in self._peer_health.values():
+        # 迭代前先取快照：这个 dict 会被心跳线程写入，直接迭代可能撞上
+        # "dictionary changed size during iteration"
+        for health in list(self._peer_health.values()):
             if health.get('instance') == instance:
                 health.update(ok=True, at=time.monotonic(), error='')
                 return
@@ -1663,7 +1733,7 @@ class Supervisor(TakeoverMixin, RemoteMixin):
 
         注意：**从没跟它打过交道的，不当成离线**（否则插件刚启动时会满屏误报）。
         """
-        seen = [health for health in self._peer_health.values()
+        seen = [health for health in list(self._peer_health.values())
                 if health.get('instance') == instance]
         if not seen:
             return True
@@ -1722,8 +1792,8 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         """缓存被认为"还新鲜"的时长（秒）：心跳间隔的几倍，够兜住偶发的一两次失败。
 
         ⚠️ 上界 60 秒是刻意的：心跳间隔可以配得很大（甚至被关掉），但"实时状态"不该
-        拿一分钟前的东西顶上 —— 超过就当没有缓存，退回现场探测。下界 15 秒则保证
-        心跳正常（默认 5 秒）时不会因为偶尔一次失败就退化回同步等待。
+        拿一分钟前的东西顶上 —— 超过就当没有缓存，这一轮该地址不提供数据。下界 15 秒则保证
+        心跳正常（默认 5 秒）时不会因为偶尔一次失败就丢掉数据（读路径不会再同步探测）。
         """
         tick = self._config.state_tick
         return min(60.0, max(15.0, 3.0 * tick)) if tick > 0 else 15.0
@@ -1748,12 +1818,18 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                 missing.append(address)
         if not missing:
             return ready
-        # 只对"完全没缓存"的地址现场问一次（例如插件刚起来、心跳还没跑第一轮，
-        # 或者把 state_tick 关掉了）—— 有缓存就绝不在读路径上同步等待。
-        for reply in self._bus.broadcast(missing, {'type': 'state'}, timeout=2.0):
-            snapshot = self._snapshot_from_reply(reply)
-            if snapshot is not None:
-                ready.append(snapshot)
+        # 读路径**绝不**发起网络请求。这里以前会对"完全没有缓存"的地址现场问一次
+        # （broadcast(timeout=2.0)），而 !!ig status / diag / check 以及 sleep/wake 的前置检查
+        # 都在 MCDR 的命令线程上调用本函数 —— 对端被防火墙丢包（不是干脆拒绝）时每个地址要等满
+        # 约 2 秒，几个死对端就足以触发「TaskExecutor 线程已经 10 秒没有响应」。
+        # 更糟的是把 state_tick 设为 0（配置里明确支持"关掉心跳"）时缓存永远不新鲜，
+        # 于是每次命令都要重来一遍。
+        # 现在：没有新鲜缓存就把该地址当作"这一轮没有数据"（调用方会退回本地旧快照，
+        # 并把那些行标成不可信），探测一律交给心跳 _poll_peers —— 它在后台线程里跑，慢一点无所谓。
+        self._logger.debug(
+            f'{len(missing)} 个对端地址没有新鲜快照，本次不发起同步探测（等心跳）：'
+            + ', '.join(missing)
+        )
         return ready
 
     # ================================================================== 事件入口
@@ -1896,13 +1972,18 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         try:
             if info is None or getattr(info, 'is_user', False) or getattr(info, 'is_player', False):
                 return
-            if not any(m.role == 'self' for m in self._managed.values()):
-                return
             content = self._ANSI_RE.sub('', str(getattr(info, 'content', '') or '')).strip()
         except Exception as exc:  # noqa: BLE001
             self._logger.debug(f'解析服务端输出失败：{type(exc).__name__}: {exc}')
             return
         if not content:
+            return
+        # ⚠️ 忙碌（备份 / 保存）的解析必须排在"本实例有没有 role=self"的早返回**之前**：
+        # 全靠 role=command 的部署里一个 role=self 都没有，而那些子服同样需要备份保护。
+        # 以前那个 return 把 _note_busy_output 一起跳过了 —— 备份跑到一半被自动休眠打断，
+        # 而且一点提示都没有（静默失效）。
+        self._note_busy_output(content)
+        if not any(m.role == 'self' for m in self._managed.values()):
             return
         for pattern in self._JOINED_PATTERNS:
             matched = pattern.match(content)
@@ -1914,7 +1995,6 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             if matched:
                 self.on_player_left(matched.group('name'))
                 return
-        self._note_busy_output(content)
 
     def _note_busy_output(self, content: str) -> None:
         """服务端说"我在备份/保存"时，记下"先别关它"。
@@ -1930,8 +2010,11 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             if pattern.search(content):
                 now = time.monotonic()
                 hold = self._config.busy_hold_seconds
+                # 覆盖**所有由本实例启停**的子服（self 与 command 两种角色）：
+                # 以前这里只写 role=self，于是纯 role=command 的部署里备份保护是空的 ——
+                # 而那类子服同样会被自动休眠打断备份。
                 for managed in self._managed.values():
-                    if managed.role != 'self':
+                    if managed.role not in MANAGED_ROLES:
                         continue
                     managed.busy_until = now + hold
                     managed.busy_reason = content[:120]
@@ -1960,7 +2043,32 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             raise ValueError(self.tr('internal.missing_command', what=what))
         cwd = working_directory or None
         self._logger.info(f'执行{what}：{command}（工作目录 {cwd or os.getcwd()}）')
-        subprocess.Popen(command, cwd=cwd, shell=True)  # noqa: S602 - 命令来自管理员自己的配置
+        # 三个 DEVNULL 是必要的：不重定向的话子进程会继承 MCDR 的 stdio（占住控制台管道），
+        # 而且 Popen 的返回值以前被直接丢掉 —— 命令不存在 / 权限不足这类错误只会留下一行 info，
+        # POSIX（用户的真实服务端就在 macOS 上）上反复启停还会攒僵尸进程。
+        # 这里保存句柄、1.5 秒后回收一次：立刻 poll 会把"正在运行的正常进程"也当成失败。
+        proc = subprocess.Popen(  # noqa: S602 - 命令来自管理员自己的配置
+            command, cwd=cwd, shell=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._reap_command(proc, what)
+
+    def _reap_command(self, proc: subprocess.Popen, what: str) -> None:
+        """后台等一小会儿再回收命令进程，用于尽早发现"启动命令根本没跑起来"。"""
+        def wait_and_check() -> None:
+            try:
+                code = proc.wait(timeout=1.5)
+            except subprocess.TimeoutExpired:
+                return          # 还在跑：正常（服务端本来就是长驻进程）
+            except Exception as exc:  # noqa: BLE001
+                self._logger.debug(f'回收{what}进程时出错：{type(exc).__name__}: {exc}')
+                return
+            if code != 0:
+                self._logger.error(f'{what}进程已退出，返回码 {code} —— 启动可能失败了，请检查命令与工作目录')
+            else:
+                self._logger.warning(f'{what}进程立刻正常退出（返回码 0）：若服务端没起来，检查命令是否为后台驻留式')
+
+        threading.Thread(target=wait_and_check, name='IdleGuard-CmdReap', daemon=True).start()
 
     # ---- 供命令模块使用的操作入口（会自行广播到其它实例） ----
 
