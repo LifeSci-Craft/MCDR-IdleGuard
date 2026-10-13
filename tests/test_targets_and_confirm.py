@@ -190,5 +190,5 @@ def test_chat_confirm_prompt_carries_buttons(supervisor):
     cmd_mod._cmd_action(source, supervisor, 'sleep', '1')
     widget = source.widgets[-1]
     payload = str(widget.to_json_object())
-    assert f'!!ig confirm' in payload and f'!!ig cancel' in payload, payload
+    assert '!!ig confirm' in payload and '!!ig cancel' in payload, payload
     assert 'green' in payload, payload
