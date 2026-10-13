@@ -14,7 +14,7 @@ from typing import Dict, List, Tuple
 
 from mcdreforged.api.rtext import RColor
 
-from .supervisor import MANAGED_ROLES, Supervisor
+from .supervisor import Supervisor
 
 #: 一行诊断 = (文本, 颜色)
 Row = Tuple[str, RColor]
