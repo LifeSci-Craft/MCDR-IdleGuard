@@ -1,13 +1,13 @@
 {
   "id": "idle_guard",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "name": "Idle Guard",
   "description": {
     "zh_cn": "Velocity 群组服子服务器空闲守卫：持续无人自动休眠、玩家连接自动唤醒、支持跨服通知与状态查询",
     "en_us": "Idle guard for Velocity backend servers: auto-sleep when empty, auto-wake on player connect, with cross-server notification and status query"
   },
   "author": [
-    "LAM Chi Ming"
+    "Pau1am"
   ],
   "dependencies": {
     "mcdreforged": ">=2.13.0"

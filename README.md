@@ -10,7 +10,7 @@
 
 [![MCDR](https://img.shields.io/badge/MCDReforged-%3E%3D2.13-blue)](https://mcdreforged.com/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue)](https://www.python.org/)
 
 [English](README_en.md) | **简体中文**
 
@@ -52,7 +52,7 @@
 控制台里的状态表：
 
 ```
-================= Idle Guard v1.1.0 ==================
+================= Idle Guard v1.2.0 ==================
 #  子服      角色      状态    人数  备注       开关
 1  Survival  本实例    运行中  1/20  @Survival  [休眠]
 2  Creative  对方实例  已休眠  0     @Creative  [开启]
@@ -63,7 +63,7 @@
 
 ## 安装
 
-1. 把 `idle_guard-1.1.0.mcdr` 放进**每个子服的 MCDR** 的 `plugins/` 目录（推荐每个子服一个实例）；
+1. 把 `idle_guard-1.2.0.mcdr` 放进**每个子服的 MCDR** 的 `plugins/` 目录（推荐每个子服一个实例）；
 2. 执行 `!!MCDR plugin reload idle_guard`，或重启 MCDR；
 3. 首次启动会生成 `config/idle_guard/config.json`。**先按自己的拓扑改 `servers` 再让它跑**；
 4. 执行 `!!ig status` 看各子服状态。
@@ -297,6 +297,7 @@ survival 已休眠
 
 `!!ig check` 会显示当前口令的**指纹**（8 位十六进制）；两个实例对不上时，用它可以一眼看出
 是"口令不一致"还是"那台实例没运行"（这两种表现都是连不上，很难分）。
+口令本身不会打进日志（日志经常被整段贴出来），要对照就看指纹。
 
 </details>
 

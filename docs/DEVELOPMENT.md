@@ -76,7 +76,7 @@
 **配置文件按功能分组（只在文件层面）。** `config.py` 里的字段一律平铺（代码与测试直接读属性），
 写进 `config.json` 时由 `CONFIG_LAYOUT` + `Config.serialize()` 归成 `sleep` / `startup` / `announce` /
 `fake_server` / `bus` / `servers` 几段，读回来时 `Config.deserialize()` 先摊平。这么做有两个好处：
-老配置（平铺写法）**照原样能读**（不必写迁移、不会丢值），而且加字段时不用改 300 个测试。
+老配置（平铺写法）**照原样能读**（不必写迁移、不会丢值），而且加字段时不用改 309 个测试。
 `announce` 是"真子对象 + 布局组"重叠的那一个（多塞了 `player_attempt_window`），两个方向都要保留
 它自己的字段（`tests/test_config_defaults.py` 有专门的用例盯着）。
 
@@ -217,6 +217,12 @@
 # 单元 / 集成测试（不需要 Minecraft）
 python -m pytest tests/ -q
 
+# 压测 smoke：驱动 50 轮状态心跳，核对不崩、无异常日志（不需要 Minecraft）
+python tools/soak.py --rounds 50
+
+# 静态检查（配置见仓库根的 ruff.toml）
+python -m ruff check .
+
 # 打包（剥离注释与 docstring、时间戳固定、可复现）+ 产物自检
 python tools/build.py
 python tools/check_artifact.py
@@ -225,10 +231,10 @@ python tools/check_artifact.py
 python tools/mcdr_matrix.py
 python tools/mcdr_matrix.py --reuse      # 复用已有实例目录（不做删除动作）
 
-# 端到端场景（需要 test-network/ 那套真实群组服已启动）
-python test-network/start_all.py --wait 180
-python test-network/scenario_idle_guard.py   # 报告：test-network/logs/e2e_report.md
-python test-network/stop_all.py
+# 端到端场景（需要上一级的 ../test-network/ 那套真实群组服已启动）
+python ../test-network/start_all.py --wait 180
+python ../test-network/scenario_idle_guard.py   # 报告：../test-network/logs/e2e_report.md
+python ../test-network/stop_all.py
 ```
 
 打包白名单：包根只放 `mcdreforged.plugin.json` / `requirements.txt` / `CHANGELOG.md` / `LICENSE` 与
@@ -238,7 +244,7 @@ python test-network/stop_all.py
 
 已实测：
 
-- 单元 / 集成测试 **183 项全部通过**（`python -m pytest tests/`）：协议编解码、SLP 查询、假服务端
+- 单元 / 集成测试 **349 项全部通过**（`python -m pytest tests/`）：协议编解码、SLP 查询、假服务端
   应答与登录打断、总线鉴权与收发（含两个真实例互发指令）、命令层（控制台来源、异步不阻塞、
   reload 的两条提示）、界面标准（顶栏与底线同宽、底线提示居中、帮助页两列对齐、浮窗每行不超过
   32 列、开关列可点）、多语言（选语言 / 同语族兜底 / 缺键退回英文 / 用户覆盖文件 / 两份语言文件
@@ -249,21 +255,32 @@ python test-network/stop_all.py
   权限（遍历命令树确认每条命令都要求 admin，并用 `execute_command` 验证普通玩家拿不到状态表）、
   休眠限制、启动耗时记录、文案一致性（中英文里前缀只有一种颜色）、自己解析服务端进 / 退消息、
   漏报离开的自愈门槛、远程休眠的同步预检，以及 `role: command` 模式（真实子进程 + 真实端口）。
+  测试数量以最新一版 CHANGELOG 的验证节为准（避免改代码后这里的数字慢慢漂掉）。
 - **跨版本矩阵**：MCDR 2.13.0 / 2.14.1 / 2.15.0 / 2.15.7 / 2.16.0 五个版本各起一个真实 MCDR，
   跑 `!!ig help` / `!!ig status` / `!!ig reload` 全部通过、无 Traceback；2.12.0（低于最低版本）
   被依赖检查干净卸掉。
+  - 仓库内 `.workbuddy/env/matrix/` 下会留下**历史版本**的实例目录与 `run_out.txt`：在里面做全文检索时
+    请用 `git grep`（直接 grep 整个目录会命中旧副本，误判成"代码没删干净"）。
 - 打包产物自检：同一源码打两次字节完全相同、内容白名单、注释与 docstring 已剥离且剥离后仍可编译、
   两种安装布局都正确。
 - **测试网络真机**（Velocity 3.5.1 + 2 台 Paper 1.21.4 + 2 个 MCDR 实例）：
-  - 端到端场景全绿（`test-network/logs/e2e_report.md`）：空闲休眠、假服务端接管端口、跨服通知、
+  - 端到端场景 **38/41**（`../test-network/logs/e2e_report.md`）：空闲休眠、假服务端接管端口、跨服通知、
     连接触发唤醒、单独提醒玩家、二次休眠；
-  - 顶栏与底线宽度精确相等（实测都是 58 列）；跨实例 `!!ig sleep` 在 1.5 秒内回结果；
+  - ⚠️ 剩下 3 项与代码缺陷无关，但需要决定怎么处理：
+    ①「休眠预告送达玩家」对应的是 **v1.1.0 已删除的 `announce.warn_before_sleep`**
+    （休眠前 15 秒的预告），场景断言过时 —— 要么更新场景，要么恢复该功能；
+    ② 远端子服的 `sleep` 现在由**负责它的实例**判断（本实例不再用心跳缓存抢先回绝，
+    否则会把该执行的操作挡掉），所以「对休眠中的服再 sleep」会先给确认提示、
+    确认后才由负责方回"不用再休眠了"；本实例自己负责的子服行为不变；
+    ③「对运行中的服 wake」那条抓到的是假玩家被史莱姆击杀的死亡消息（日志取样撞车），
+    属场景噪声，重跑通常就会过；
+  - 顶栏与底线宽度精确相等（实测都是 58 列）；跨实例动作由负责方执行并回结果（实测秒级）；
   - 玩家对着休眠中的子服输入 `/server` 收到的原文是
     `服务器 survival 已休眠，正在自动启动…预计 25 秒后可用，请稍后再用 /server survival 进入`，
     随后是 `服务器 survival 已开启 (耗时 8 秒)，可现在进入：/server survival`；
   - 音效实测：假玩家（mineflayer）日志里出现 `SOUND minecraft:block.note_block.pling`；
   - 状态心跳实测（把 `check_interval` 设成 30 秒、`state_tick` 5 秒）：直接 kill 服务端进程后
-    0.5 秒状态变成"未运行"，远程唤醒就绪后 2.5 秒另一实例就看到"运行中"。
+    0.5 秒状态变成"未运行"，远程唤醒就绪后另一实例在 2-4 秒内看到"运行中"。
 - **用户线上环境**（Fabric 26.3 + MCDR 2.16.0，两个实例）：
   - 玩家退出后插件仍认为有人在线的问题已定位并修复。取证原文：服务端打印
     `System chat: Pau1am left the game`，插件则一直报 `Creative 还有 1 名玩家在线（Pau1am）`；
@@ -282,12 +299,13 @@ python test-network/stop_all.py
 
 这些是环境问题，不是插件缺陷，别重复踩：
 
-- 无 tty 运行时用 `config.yml` 的 `advanced_console: false` 加 `tools/console_daemon.py` /
-  `send_cmd.py`；`!!MCDR stop` 无效，停服用 `stop`。
+- 无 tty 运行时用 `config.yml` 的 `advanced_console: false` 加
+  `../test-network/tools/console_daemon.py` / `../test-network/send_cmd.py`；
+  `!!MCDR stop` 无效，停服用 `stop`。
 - 玩家在游戏里发的 `!!` 命令不会被 MCDR 处理，MCDR 也收不到进服事件，所以权限与事件类场景改用
   `CommandManager.execute_command` / SLP 在 pytest 里验。
 - 给控制台发 `stop` 会连 MCDR 一起关掉（`EXIT_AFTER_STOP`），要模拟"只停服务端"必须按 PID 杀
-  java 进程（匹配 `cwd == test-network/<子服>/server`）。
+  java 进程（匹配 `cwd == ../test-network/<子服>/server`）。
 - 手工实验前先把 `idle_timeout` 调大（例如 900）并重载；`!!ig lock` 会连唤醒一起挡掉。
 - Paper 经代理连接过之后停服约 7 秒才释放端口；选端口前先 `netstat -ano | grep LISTENING`。
 
