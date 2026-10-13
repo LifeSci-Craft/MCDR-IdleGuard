@@ -7,10 +7,13 @@
   字节相同 —— 否则"按 tag 重新构建再比 sha256"这句承诺就是假的。
 * **内容**：只允许插件代码 + 元数据 + LICENSE + CHANGELOG 进包。白名单之外的任何东西
   （README、tests/、tools/、__pycache__）都是打包器的 bug。
+* **不漏包**：源码目录 `idle_guard/` 下的每个 `*.py` 与 `lang/*.json` 都必须出现在产物成员里。
+  白名单是手工维护的，"新增模块忘了加进白名单"会静默丢包 —— 必须在这里被拦下。
 * **剥离**：注释与 docstring 属于仓库、不属于产物。这里对包内每个 .py 再跑一遍 tokenize
   与 ast —— 只看体积的话，"剥离器悄悄失效"是发现不了的。
-* **可加载**：包内 mcdreforged.plugin.json 能解析且 id/版本符合预期，每个 .py 剥离之后
-  仍然能编译（剥离用的是 tokenize + ast，出错就会变成用户那边的语法错误）。
+* **可加载**：包内 mcdreforged.plugin.json 能解析，且 id / author 符合预期、version 与
+  `idle_guard/__init__.py` 里的 `PLUGIN_VERSION` 一致；每个 .py 剥离之后仍然能编译
+  （剥离用的是 tokenize + ast，出错就会变成用户那边的语法错误）。
 
 用法::
 
@@ -25,6 +28,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -37,6 +41,12 @@ sys.path.insert(0, ROOT)
 import tools.build as build  # noqa: E402
 
 PLUGIN_ID = build.PLUGIN_ID
+
+#: 元数据里该写的作者（原样比对，多了少了都算错）
+EXPECTED_AUTHOR = ['Pau1am']
+
+#: 源码里版本号的写法（`idle_guard/__init__.py`）
+VERSION_PATTERN = re.compile(r"^PLUGIN_VERSION\s*=\s*['\"]([^'\"]+)['\"]", re.M)
 
 #: 允许出现在包里的条目（其余一律视为打包器 bug）。代码/数据在 PLUGIN_ID/ 目录下。
 EXPECTED_ROOT = {'mcdreforged.plugin.json'}
@@ -65,6 +75,57 @@ def _read(path: str, name: str) -> bytes:
         return archive.read(name)
 
 
+def _packed_members(path: str) -> set:
+    """产物里 PLUGIN_ID/ 目录下的成员（相对包目录，子目录用 / 分隔）。"""
+    return {name[len(PLUGIN_ID) + 1:] for name in _members(path) if name.startswith(PLUGIN_ID + '/')}
+
+
+def source_members() -> list:
+    """源码目录里"本该进包"的每一个文件：`*.py` 与 `lang/*.json`。
+
+    故意不查 ``build.collect_files()``：那正是白名单本身，拿它比对等于自己跟自己比。
+    这里独立地把源码目录数一遍，才能发现"新加了模块但白名单没跟"。
+    """
+    members = []
+    package = os.path.join(ROOT, PLUGIN_ID)
+    for name in sorted(os.listdir(package)):
+        full = os.path.join(package, name)
+        if os.path.isfile(full):
+            if name.endswith('.py'):
+                members.append(name)
+        elif os.path.isdir(full) and name == 'lang':
+            members.extend(f'lang/{sub}' for sub in sorted(os.listdir(full))
+                           if os.path.isfile(os.path.join(full, sub)) and sub.endswith('.json'))
+    return members
+
+
+def source_version(problems: list) -> str:
+    """从 `idle_guard/__init__.py` 里读出 `PLUGIN_VERSION`（读不出来时记一条问题并返回空串）。
+
+    为什么用文本匹配而不是 `import idle_guard`：那会连带导入 mcdreforged，
+    于是这个自检只能在装好 MCDR 的解释器里跑（CI 里未必装）。
+    """
+    path = os.path.join(ROOT, PLUGIN_ID, '__init__.py')
+    try:
+        with open(path, encoding='utf-8') as handle:
+            match = VERSION_PATTERN.search(handle.read())
+    except OSError as error:
+        problems.append(f'读不出源码版本（{path}）：{type(error).__name__}: {error}')
+        return ''
+    if match is None:
+        problems.append(f'{path} 里找不到 PLUGIN_VERSION = "..."，无法核对产物版本')
+        return ''
+    return match.group(1)
+
+
+def check_member_coverage(path: str, problems: list) -> None:
+    """源码目录里有的，产物里必须都有 —— 防"新增模块忘记进白名单"式的静默丢包。"""
+    packed = _packed_members(path)
+    missing = [name for name in source_members() if name not in packed]
+    if missing:
+        problems.append(f'源码里有、产物白名单没包含（新增文件忘了加进白名单？）：{sorted(missing)}')
+
+
 def check_contents(path: str, problems: list) -> dict:
     names = _members(path)
     roots = {name for name in names if '/' not in name}
@@ -73,7 +134,7 @@ def check_contents(path: str, problems: list) -> dict:
     for forbidden in FORBIDDEN_ROOTS:
         if any(name == forbidden.rstrip('/') or name.startswith(forbidden) for name in names):
             problems.append(f'包里不该出现 {forbidden}')
-    members = {name[len(PLUGIN_ID) + 1:] for name in names if name.startswith(PLUGIN_ID + '/')}
+    members = _packed_members(path)
     if members != EXPECTED_MEMBERS:
         missing = EXPECTED_MEMBERS - members
         extra = members - EXPECTED_MEMBERS
@@ -81,6 +142,13 @@ def check_contents(path: str, problems: list) -> dict:
     metadata = json.loads(_read(path, 'mcdreforged.plugin.json').decode('utf-8'))
     if metadata.get('id') != PLUGIN_ID:
         problems.append(f'元数据 id 不是 {PLUGIN_ID}：{metadata.get("id")!r}')
+    if metadata.get('author') != EXPECTED_AUTHOR:
+        problems.append(f'元数据 author 不是 {EXPECTED_AUTHOR}：{metadata.get("author")!r}')
+    # 版本号在源码里也有一份，两处对不上就说明发版时漏改了其中一个
+    declared = source_version(problems)
+    if declared and metadata.get('version') != declared:
+        problems.append(f'产物版本 {metadata.get("version")!r} 与 {PLUGIN_ID}/__init__.py 的 '
+                        f'PLUGIN_VERSION {declared!r} 不一致（发版时漏改了其中一个？）')
     return metadata
 
 
@@ -107,8 +175,24 @@ def check_stripped(path: str, problems: list) -> None:
             problems.append(f'{name} 不能编译：{error}')
 
 
+def member_hashes(path: str) -> dict:
+    """产物里每个成员 -> 解包后内容的 sha256。
+
+    这一层刻意不看 zip 本身（压缩级别、deflate 实现、时间戳都不参与），
+    所以**换解释器、换 zlib 版本也应当一致** —— 是"可复现"里跨机器成立的那一半。
+    """
+    with zipfile.ZipFile(path) as archive:
+        return {name: hashlib.sha256(archive.read(name)).hexdigest()
+                for name in archive.namelist()}
+
+
 def check_reproducible(tmp: str, problems: list) -> str:
-    """在临时目录里打两次，两次必须字节相同。返回第一次的产物路径。"""
+    """在临时目录里打两次，逐成员内容与整包字节都要一致。返回第一次的产物路径。
+
+    两个层次的结论分开报，措辞不混：**逐成员内容**是跨解释器 / 跨 zlib 都成立的那一层；
+    **整包字节**更严（连 zip 头、压缩流都要求逐字节相同），同一解释器下必然成立，
+    换解释器就可能天然不同 —— 那种情况下以逐成员一致为准。
+    """
     original_output = build.OUTPUT_DIR
     hashes, paths = [], []
     try:
@@ -125,8 +209,22 @@ def check_reproducible(tmp: str, problems: list) -> str:
                 paths[0] = first
     finally:
         build.OUTPUT_DIR = original_output
-    if hashes[0] != hashes[1]:
-        problems.append(f'同一源码打两次结果不同：{hashes[0]} != {hashes[1]}')
+
+    first_members, second_members = member_hashes(paths[0]), member_hashes(paths[1])
+    if first_members == second_members:
+        print('  逐成员内容 sha256：一致（跨解释器 / 跨 zlib 也成立）')
+    else:
+        differing = sorted(set(first_members) ^ set(second_members))
+        differing += sorted(name for name in set(first_members) & set(second_members)
+                            if first_members[name] != second_members[name])
+        problems.append(f'同一源码打两次，解包后内容不一致的成员：{differing}')
+
+    if hashes[0] == hashes[1]:
+        print('  整包字节 sha256：一致（更严的附加项：连 zip 头与压缩流都逐字节相同）')
+    else:
+        problems.append(f'整包字节不一致（同一解释器下这是打包不确定性的 bug；'
+                        f'跨解释器 / 跨 zlib 时这一项天然会不同，此时以"逐成员内容一致"为准）：'
+                        f'{hashes[0]} != {hashes[1]}')
     return paths[0]
 
 
@@ -165,6 +263,12 @@ def check_folder_layout(tmp: str, problems: list) -> None:
 
 
 def main() -> int:
+    # 输出被重定向（管道 / 文件）时，Windows 会按 locale 编码 stdout（中文机器上是 GBK），
+    # 下面那些 ✗ 会直接 UnicodeEncodeError 崩掉 —— 失败信息反而看不见。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace')
+
     parser = argparse.ArgumentParser()
     parser.add_argument('artifact', nargs='?', help='已有的 .mcdr；不给就重新构建两次')
     args = parser.parse_args()
@@ -175,6 +279,7 @@ def main() -> int:
         print(f'检查已有产物：{args.artifact}')
         for path in paths:
             metadata = check_contents(path, problems)
+            check_member_coverage(path, problems)
             check_stripped(path, problems)
             print(f'  {os.path.basename(path)}  size={os.path.getsize(path)} '
                   f'sha256={sha256(path)[:16]}…  version={metadata.get("version")}')
@@ -184,6 +289,7 @@ def main() -> int:
         try:
             path = check_reproducible(tmp, problems)
             metadata = check_contents(path, problems)
+            check_member_coverage(path, problems)
             check_stripped(path, problems)
             print(f'  {os.path.basename(path)}  size={os.path.getsize(path)} '
                   f'sha256={sha256(path)[:16]}…  version={metadata.get("version")}')
@@ -196,7 +302,8 @@ def main() -> int:
         for problem in problems:
             print(f'  ✗ {problem}')
         return 1
-    print('\n全部通过：可复现、内容白名单、注释与 docstring 已剥离、代码仍可编译。')
+    print('\n全部通过：可复现（逐成员 + 整包）、内容白名单、无漏包、注释与 docstring 已剥离、'
+          '元数据与源码版本一致、代码仍可编译。')
     return 0
 
 
