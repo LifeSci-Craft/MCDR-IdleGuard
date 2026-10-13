@@ -28,7 +28,9 @@ from typing import Any, List, Optional, Tuple
 # 常量
 # --------------------------------------------------------------------------- #
 
-#: 单个数据包的最大长度（协议规定 2^21-1，这里留一点余量做防御）
+#: 单个数据包的最大长度。协议里长度前缀是 VarInt，能表达到 2^21-1 以上，但服务端实现
+#: （以及本插件的读取侧）都把上限放在这里；写入侧也必须拿同一个常量挡住，否则会出现
+#: "自己打出来的包自己解不开"。
 MAX_PACKET_LENGTH = 2 ** 21 - 1
 
 #: 状态查询里握手包 next_state = 1，登录是 2
@@ -70,13 +72,26 @@ def encode_long(value: int) -> bytes:
 
 
 def pack_packet(packet_id: int, payload: bytes = b'') -> bytes:
-    """按 [长度 VarInt][包 ID VarInt][负载] 打包一个数据包。"""
+    """按 [长度 VarInt][包 ID VarInt][负载] 打包一个数据包。
+
+    出站也校验长度：读取侧有 MAX_PACKET_LENGTH 上限，写入侧以前一个检查都没有 ——
+    负载一旦变大（MOTD、聊天组件变长）就会打出"我们自己都解析不了"的包，
+    而且失败是静默的（对端只会断开）。
+    """
     body = encode_varint(packet_id) + payload
+    if len(body) > MAX_PACKET_LENGTH:
+        raise ValueError(f'数据包过长（{len(body)} 字节 > 上限 {MAX_PACKET_LENGTH}）')
     return encode_varint(len(body)) + body
 
 
 def decode_varint(data: bytes, offset: int = 0) -> Tuple[int, int]:
-    """从 bytes 的 offset 处解析 VarInt，返回 (值, 新的 offset)。"""
+    """从 bytes 的 offset 处解析 VarInt，返回 (值, 新的 offset)。
+
+    按协议只接受**最多 5 字节 / 32 位**。以前判的是 `shift > 35`，于是 6 字节的畸形串
+    能解出大于 2^32 的"正数" —— 与 encode 端的有符号语义不对称，而且这种值会被后面
+    当成长度或下标继续用（隐患）。现在：超过 5 字节、或第 5 个字节还带超出 32 位的数据位，
+    一律直接报错。
+    """
     result = 0
     shift = 0
     while True:
@@ -84,12 +99,15 @@ def decode_varint(data: bytes, offset: int = 0) -> Tuple[int, int]:
             raise ValueError('VarInt 数据不完整')
         byte = data[offset]
         offset += 1
+        if shift == 28 and (byte & 0x7F) > 0x0F:
+            # 第 5 个字节只允许贡献 4 个数据位（32 位整数的最后 4 位）
+            raise ValueError('VarInt 超出 32 位')
         result |= (byte & 0x7F) << shift
         if not byte & 0x80:
             break
         shift += 7
-        if shift > 35:
-            raise ValueError('VarInt 过长')
+        if shift > 28:
+            raise ValueError('VarInt 过长（超过 5 字节）')
     return result, offset
 
 

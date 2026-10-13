@@ -19,7 +19,7 @@ from __future__ import annotations
 import unicodedata
 from typing import List, Sequence
 
-from mcdreforged.api.all import RAction, RColor, RText, RTextBase, RTextList
+from mcdreforged.api.all import RColor, RText, RTextBase, RTextList
 
 #: 插件名（顶栏、聊天前缀都用它，随插件元数据）
 PLUGIN_NAME = 'Idle Guard'
@@ -157,19 +157,3 @@ def title_text(version: str) -> RTextBase:
     """顶栏中间那段：插件名 aqua + 版本黄（所有界面共用）。"""
     return RTextList(RText(PLUGIN_NAME, RColor.aqua), RText(f' v{version}', RColor.yellow))
 
-
-def hover_line(text: str, hover: str) -> RText:
-    return RText(text).set_hover_text(hover)
-
-
-# --------------------------------------------------------------------------- #
-# 命令段（可点：能裸跑的直接执行，要参数的填进输入框）
-# --------------------------------------------------------------------------- #
-
-def command_text(text: str, *, run: bool, hover: str, fill: Optional[str] = None) -> RText:
-    node = RText(text, RColor.aqua).set_hover_text(hover)
-    if run:
-        node.set_click_event(RAction.run_command, text if fill is None else fill)
-    else:
-        node.set_click_event(RAction.suggest_command, fill if fill is not None else text)
-    return node

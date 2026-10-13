@@ -221,15 +221,21 @@ class _FakePluginServer:
         return self._config
 
 
-def test_first_run_prints_the_generated_token(tmp_path):
-    """首次生成配置时要把口令印出来，否则用户不知道别的实例该填哪串。"""
+def test_first_run_prints_the_token_fingerprint_not_the_token(tmp_path):
+    """首次生成配置时只印**指纹**，不印口令本身。
+
+    口令必须与其它实例一致，所以要提醒一句；但口令不该进日志 ——
+    这个插件的日志习惯是"出问题就整段贴出来"，而 8 位指纹足够两边对照。
+    """
     from idle_guard import _load_config
+    from idle_guard.supervisor import token_fingerprint
 
     config = Config(instance_name='Survival')
     fake = _FakePluginServer(str(tmp_path), config)
     assert _load_config(fake) is config
     log = fake.logger.text()
-    assert config.bus.token in log, log
+    assert token_fingerprint(config.bus.token) in log, log
+    assert config.bus.token not in log, f'口令本身不该出现在日志里：{log}'
     assert '填到' in log or '复制' in log, log
 
 
