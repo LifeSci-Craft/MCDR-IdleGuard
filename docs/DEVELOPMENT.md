@@ -183,6 +183,15 @@
 - **空闲计时与 `auto_sleep` 解耦**：`_check_idle` 照常维护 `empty_since`（浮窗要显示），
   只有 `role in MANAGED_ROLES and auto_sleep and not locked` 时才真的关服。
 
+## 文案与语言
+
+玩家可见的文字都在插件的 `idle_guard/lang/<语言>.json`（内置 `zh_cn` 与 `en_us`），`config.json` 里没有文案，
+只有 `language` 决定用哪一份（`auto` = 跟随 MCDR）。缺键会退回英文，再缺就用键名本身显示。
+
+要改其中若干句而不动插件本体：在 `config/idle_guard/lang/` 下建一个同名文件（例如 `zh_cn.json`），
+只写要改的键；启动时先读内置文件，再用这份覆盖同名键。插件不会创建也不会修改该目录，升级不会覆盖它。
+键名对照插件包内的 `lang/en_us.json`。
+
 ## 一台 MCDR 管多台子服
 
 每个子服各跑一个 MCDR 是最省心的拓扑（跨服通知天然准确、每台状态都由它自己算），但 MCDR 也是常驻进程
