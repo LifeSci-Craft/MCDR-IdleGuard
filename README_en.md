@@ -76,7 +76,7 @@ its default.
 | `instance_name` | `"auto"` | Name of this instance, used in logs and on the bus. `auto` = the name of the server it owns |
 | `language` | `"auto"` | UI language. `auto` = follow MCDR, or set `zh_cn` / `en_us` |
 | `debug` | `false` | Print per-scan details to the console |
-| `velocity_config` | `"auto"` | Add servers from `velocity.toml`; `"off"` = disabled |
+| `velocity_config` | `"auto"` | Sync servers from `velocity.toml` (it replaces the sample entries of the default config); `"off"` = disabled |
 
 ### `servers[]`
 
