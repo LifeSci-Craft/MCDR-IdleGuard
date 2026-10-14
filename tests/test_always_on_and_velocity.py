@@ -2,8 +2,9 @@
 
 - **常驻**：给"希望长期开着、不必休眠"的子服一个总开关。开了之后自动判定不关它，
   管理员手敲 `!!ig sleep`（包括从别的实例发来的）也会被直接拒绝。
-- **Velocity 同步**：Velocity 里已经写了每个子服的名字与地址，插件启动时读一遍，
-  把还没写进 `servers[]` 的补进来（已有条目一律不动，地址对不上只提醒）。
+- **Velocity 同步**：Velocity 里已经写了每个子服的名字与地址，插件启动时读一遍：
+  缺的补进来；默认配置里"一个字没改"的示例条目（lobby / survival）按它改写或删除；
+  用户改过的条目一律不动，地址对不上只提醒。
 """
 from __future__ import annotations
 
@@ -15,7 +16,8 @@ import pytest
 
 from idle_guard import commands as cmd_mod
 from idle_guard import velocity as velocity_mod
-from idle_guard.config import AnnounceConfig, BusConfig, Config, FakeServerConfig, ServerEntry
+from idle_guard.config import (AnnounceConfig, BusConfig, Config, FakeServerConfig, ServerEntry,
+                               default_servers)
 from idle_guard.mcproto import PingResult
 from idle_guard.supervisor import ServerView, State, Supervisor
 from mc_test_utils import StubMCDR, free_port, wait_until
@@ -176,10 +178,10 @@ def test_auto_mode_looks_next_to_the_mcdr_working_directory(tmp_path):
     assert velocity_mod.find_config(str(tmp_path)) == str(velocity_dir / 'velocity.toml')
 
 
-def _supervisor_in(tmp_path, monkeypatch, *, servers, velocity_config='auto'):
+def _supervisor_in(tmp_path, monkeypatch, *, servers, velocity_config='auto', toml=TOML):
     (tmp_path / 'server').mkdir(exist_ok=True)
     (tmp_path / 'server' / 'server.properties').write_text('server-port=30000\n', encoding='utf-8')
-    (tmp_path / 'velocity.toml').write_text(TOML, encoding='utf-8')
+    (tmp_path / 'velocity.toml').write_text(toml, encoding='utf-8')
     monkeypatch.chdir(tmp_path)
     config = Config(
         language='zh_cn',
@@ -248,5 +250,52 @@ def test_sync_is_quiet_when_there_is_no_velocity_file(tmp_path, monkeypatch):
     supervisor = Supervisor(stub, config, plugin_version='test')
     try:
         assert supervisor.config.servers == []
+    finally:
+        supervisor.shutdown()
+
+
+def test_pristine_samples_are_replaced_by_velocity(tmp_path, monkeypatch):
+    """默认配置自带的 lobby / survival 只是示例，不该和真实清单混在一起。"""
+    supervisor, stub = _supervisor_in(tmp_path, monkeypatch, servers=default_servers())
+    try:
+        names = {entry.name for entry in supervisor.config.servers}
+        assert names == {'Survival', 'Creative'}, names
+        assert '已删除默认配置里的示例条目' in stub.logger.text(), stub.logger.text()
+        saved = json.loads((tmp_path / 'config.json').read_text(encoding='utf-8'))
+        assert {e['name'] for e in saved['servers']} == {'Survival', 'Creative'}
+    finally:
+        supervisor.shutdown()
+
+
+def test_a_sample_matching_velocity_is_rebuilt(tmp_path, monkeypatch):
+    """示例条目名与 velocity 里的名字一致时，整条按 velocity 重建（示例里的假 bus 要清掉）。"""
+    toml = '[servers]\nsurvival = "127.0.0.1:30000"\n'
+    sample = next(e for e in default_servers() if e.name == 'survival')
+    supervisor, stub = _supervisor_in(tmp_path, monkeypatch, servers=[sample], toml=toml)
+    try:
+        entry = next(e for e in supervisor.config.servers if e.name == 'survival')
+        assert (entry.host, entry.port) == ('127.0.0.1', 30000), '示例的假端口没被 velocity 改写'
+        assert entry.bus is None, '示例里的假总线地址要清掉，否则看起来像已经配好了'
+        assert entry.role == 'auto' and entry.auto_sleep is True
+        assert '已按 velocity.toml 改写示例条目' in stub.logger.text(), stub.logger.text()
+        assert 'bus 为空' in stub.logger.text(), '要提醒管理员填 bus'
+    finally:
+        supervisor.shutdown()
+
+
+def test_edited_entries_and_extra_servers_survive_the_cleanup(tmp_path, monkeypatch):
+    """用户改过的条目、以及 velocity.toml 里没有的自建条目，都不能被删掉。"""
+    edited = ServerEntry(name='survival', host='10.0.0.9', port=12345, role='command',
+                         start_command='start.bat', bus='127.0.0.1:25601')
+    mine = ServerEntry(name='Mirror', host='127.0.0.1', port=30002, bus='127.0.0.1:25602')
+    sample = next(e for e in default_servers() if e.name == 'lobby')
+    supervisor, stub = _supervisor_in(tmp_path, monkeypatch, servers=[edited, mine, sample])
+    try:
+        by_name = {e.name: e for e in supervisor.config.servers}
+        assert set(by_name) == {'survival', 'Mirror', 'Survival', 'Creative'}, set(by_name)
+        assert (by_name['survival'].host, by_name['survival'].port) == ('10.0.0.9', 12345)
+        assert by_name['survival'].start_command == 'start.bat'
+        assert (by_name['Mirror'].host, by_name['Mirror'].port) == ('127.0.0.1', 30002)
+        assert 'lobby' not in by_name, '没改过的示例条目应该被删掉'
     finally:
         supervisor.shutdown()

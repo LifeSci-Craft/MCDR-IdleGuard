@@ -79,6 +79,25 @@ def new_bus_token() -> str:
     return secrets.token_urlsafe(18)
 
 
+def default_servers() -> List[ServerEntry]:
+    """默认配置里带的示例子服。
+
+    ⚠️ 这是**示例**，不是任何真实拓扑：某条若与这里逐字段相同，说明用户没改过它，
+    `velocity_config` 同步时可以按 velocity.toml 改写或删除
+    （见 `Supervisor._sync_servers_from_velocity`）。改这里的值等于改判定基准，别只为换例子而改。
+    """
+    return [
+        ServerEntry(
+            name='lobby', host='127.0.0.1', port=25565, role='watch',
+            auto_sleep=False, bus='127.0.0.1:25600',
+        ),
+        ServerEntry(
+            name='survival', host='127.0.0.1', port=25566, role='auto',
+            auto_sleep=True, auto_wake=True, bus='127.0.0.1:25601',
+        ),
+    ]
+
+
 @dataclass
 class BusConfig(Serializable):
     """实例间通信总线配置。"""
@@ -163,8 +182,8 @@ class Config(Serializable):
     confirm_timeout: float = 30.0
     #: Velocity 配置文件（`velocity.toml`）的路径。
     #: `auto` = 自动在 MCDR 工作目录附近查找；`off` / `''` = 关闭这个同步。
-    #: 打开时，插件启动会把 velocity.toml 的 `[servers]` 段里**还没写进 servers[]** 的子服
-    #: 自动补进来（名字、地址、端口），已有条目的设置一律不动。
+    #: 打开且读到时，`[servers]` 段是**子服清单的权威来源**：缺的子服补进来，
+    #: 默认配置里没改过的示例条目按它改写或删除；用户改过的条目一律不动（只提醒地址对不上）。
     velocity_config: str = 'auto'
     #: 服务端输出里命中这些正则时，认为它"正在忙"（备份 / 保存），这期间**不做自动休眠**。
     #: 只拦自动休眠：管理员手敲的 `!!ig sleep` 照常执行（你明确要关，插件不拦）。
@@ -180,17 +199,8 @@ class Config(Serializable):
     fake_server: FakeServerConfig = field(default_factory=FakeServerConfig)
     announce: AnnounceConfig = field(default_factory=AnnounceConfig)
 
-    #: 子服务器列表。下面是一份可直接改用的示例：
-    servers: List[ServerEntry] = field(default_factory=lambda: [
-        ServerEntry(
-            name='lobby', host='127.0.0.1', port=25565, role='watch',
-            auto_sleep=False, bus='127.0.0.1:25600',
-        ),
-        ServerEntry(
-            name='survival', host='127.0.0.1', port=25566, role='auto',
-            auto_sleep=True, auto_wake=True, bus='127.0.0.1:25601',
-        ),
-    ])
+    #: 子服务器列表，默认是一份可直接改用的示例（见 `default_servers`）：
+    servers: List[ServerEntry] = field(default_factory=default_servers)
 
 
     # ------------------------------------------------------------------ #

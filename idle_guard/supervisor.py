@@ -33,7 +33,7 @@ from mcdreforged.api.types import PluginServerInterface
 from . import i18n
 from . import velocity as velocity_module
 from .bus import Bus, parse_address
-from .config import FAKE_SERVER_BIND, LEGACY_BUS_TOKEN, Config, ServerEntry
+from .config import FAKE_SERVER_BIND, LEGACY_BUS_TOKEN, Config, ServerEntry, default_servers
 from .mcproto import PingResult, bind_error, port_open, status_ping
 from .remote import RemoteMixin
 from .takeover import TakeoverMixin
@@ -79,6 +79,16 @@ def token_fingerprint(token: Optional[str]) -> str:
     """
     text = token or ''
     return hashlib.sha256(text.encode('utf-8')).hexdigest()[:8] if text else ''
+
+
+def _is_default_sample(entry: ServerEntry, template: Dict[str, ServerEntry]) -> bool:
+    """这一条是否还是默认配置里的示例（同名，且每个字段都与示例相同）。
+
+    只有"用户一个字没改"的示例条目才允许被 velocity.toml 改写或删除 ——
+    判据是逐字段相等：改过任何一格（哪怕只是端口）就不再算示例，自动同步不会碰它。
+    """
+    sample = template.get(entry.name)
+    return sample is not None and entry.serialize() == sample.serialize()
 
 
 def _read_json_object(path: str) -> dict:
@@ -460,10 +470,15 @@ class Supervisor(TakeoverMixin, RemoteMixin):
     # ================================================================== 配置解析
 
     def _sync_servers_from_velocity(self) -> None:
-        """按 `velocity.toml` 的 `[servers]` 段补齐子服清单（**只补缺的**）。
+        """按 `velocity.toml` 的 `[servers]` 段同步子服清单。
 
-        为什么只补不改：`servers[]` 里那些 `role` / `auto_sleep` / `bus` 是管理员按本机情况
-        手写的，自动同步不该动它们；地址对不上时只提醒一句，不覆盖。
+        读到可用的 `[servers]` 时，这份清单就是**权威来源**：
+
+        - 配置里缺的子服补进来；
+        - 默认配置自带、用户一个字没改的**示例**条目（`lobby` / `survival`）按它改写或删除 ——
+          否则真实清单会和这两条示例混在一起，而且示例的假端口还会挡住同名子服的真实地址；
+        - 用户改过的条目一律不动：`role` / `auto_sleep` / `bus` 是按本机情况手写的，
+          地址对不上时只提醒一句。
         """
         setting = (self._config.velocity_config or '').strip()
         if setting.lower() in velocity_module.OFF_VALUES:
@@ -480,23 +495,56 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             self._logger.info(f'读到了 {path}，但里面没有可用的 [servers] 条目，跳过同步')
             return
 
-        known = {entry.name: entry for entry in self._config.servers}
+        template = {entry.name: entry for entry in default_servers()}
+        source = os.path.basename(path)
+        kept: List[ServerEntry] = []
+        dropped: List[str] = []
+        refreshed: List[str] = []
+        for entry in self._config.servers:
+            if _is_default_sample(entry, template):
+                address = found.get(entry.name)
+                if address is None:
+                    dropped.append(entry.name)
+                    continue
+                # 示例条目整条按 velocity.toml 重建：示例里的 bus 是编的，留着会看起来像配好了
+                entry = ServerEntry(name=entry.name, host=address[0], port=address[1])
+                refreshed.append(entry.name)
+            elif entry.name in found:
+                host, port = found[entry.name]
+                if entry.port != port or entry.host != host:
+                    self._logger.warning(
+                        f'配置里 {entry.name} 写的是 {entry.host}:{entry.port}，'
+                        f'而 {source} 里是 {host}:{port}；保留你的配置，'
+                        f'想跟着 Velocity 走就改掉这一条'
+                    )
+            kept.append(entry)
+
+        known = {entry.name for entry in kept}
         added: List[str] = []
         for name, (host, port) in sorted(found.items()):
-            entry = known.get(name)
-            if entry is None:
-                self._config.servers.append(ServerEntry(name=name, host=host, port=port))
+            if name not in known:
+                kept.append(ServerEntry(name=name, host=host, port=port))
                 added.append(name)
-            elif entry.port != port or entry.host != host:
-                self._logger.warning(
-                    f'配置里 {name} 写的是 {entry.host}:{entry.port}，'
-                    f'而 {os.path.basename(path)} 里是 {host}:{port}；保留你的配置，'
-                    f'想跟着 Velocity 走就改掉这一条'
-                )
-        if not added:
+
+        if not (dropped or refreshed or added):
             self._logger.debug(f'velocity.toml 里的 {len(found)} 个子服都已在配置中')
             return
-        self._logger.info(f'已从 {path} 补进 {len(added)} 个子服：{", ".join(added)}')
+
+        self._config.servers = kept
+        if dropped:
+            self._logger.info(
+                f'已删除默认配置里的示例条目：{", ".join(dropped)}（它们不在 {source} 中）'
+            )
+        if refreshed:
+            self._logger.info(f'已按 {source} 改写示例条目：{", ".join(refreshed)}')
+        if added:
+            self._logger.info(f'已从 {source} 补进 {len(added)} 个子服：{", ".join(added)}')
+        no_bus = [entry.name for entry in kept if entry.bus is None]
+        if no_bus:
+            self._logger.warning(
+                '这些子服还没指定负责它的实例（bus 为空），跨服通知与远程操作不可用：'
+                f'{", ".join(no_bus)}；用 !!ig check 看详情'
+            )
         self._save_config()
 
     def _save_config(self) -> None:

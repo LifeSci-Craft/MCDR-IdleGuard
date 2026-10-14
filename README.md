@@ -73,7 +73,7 @@
 | `instance_name` | `"auto"` | 本实例名，用于日志与总线。`auto` = 使用本实例负责的子服名 |
 | `language` | `"auto"` | 界面语言。`auto` = 跟随 MCDR，也可填 `zh_cn` / `en_us` |
 | `debug` | `false` | 在控制台输出每轮侦察的详细日志 |
-| `velocity_config` | `"auto"` | 从 `velocity.toml` 补充子服清单；`"off"` = 关闭 |
+| `velocity_config` | `"auto"` | 从 `velocity.toml` 同步子服清单（默认配置里的示例条目会被它替换）；`"off"` = 关闭 |
 
 ### `servers[]`
 
