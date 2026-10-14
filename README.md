@@ -23,7 +23,7 @@
 
 ## 安装
 
-1. 从 [Releases](../../releases) 下载 `idle_guard-1.2.1.mcdr`，放进每个子服 MCDR 的 `plugins/` 目录
+1. 从 [Releases](../../releases) 下载 `idle_guard-1.2.2.mcdr`，放进每个子服 MCDR 的 `plugins/` 目录
 2. 执行 `!!MCDR plugin reload idle_guard`，或重启 MCDR
 3. 按下面的说明修改 `config/idle_guard/config.json` 的 `servers`
 4. 执行 `!!ig status` 查看各子服状态
