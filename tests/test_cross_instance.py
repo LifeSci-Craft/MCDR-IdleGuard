@@ -112,6 +112,20 @@ def test_remote_sleep_waits_for_the_real_result(two_instances):
     assert instance_b.state_of('Creative').state in (State.SLEEPING, State.OFFLINE)
 
 
+def test_a_remote_no_op_reply_is_reported_verbatim(two_instances):
+    """对端回"已经开着了 / 不用再休眠了"这类"没真的动它"的答复时，要原样回报。
+
+    端到端踩到的：对**已经开着**的远端子服发 `!!ig wake`，负责方回的是
+    "已经开着了，直接 /server survival 进去就行"，但请求方会走进 `_wait_remote_state`
+    等状态变化，最后把这句更准确的答案换成千篇一律的"已开启，可以进入了"。
+    """
+    instance_a, _instance_b, *_rest = two_instances
+    ok, detail = instance_a.request_action('wake', 'Creative', by='测试', wait=True)
+    assert ok, detail
+    assert '已经开着' in detail, detail
+    assert '已开启' not in detail, detail
+
+
 def test_remote_action_without_bus_address_explains_why(two_instances):
     """没有总线地址时应当明说"没配 bus"，而不是笼统地说没人负责。"""
     instance_a, _instance_b, *_rest = two_instances
