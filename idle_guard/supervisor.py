@@ -153,6 +153,8 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         #: （对端被防火墙丢包时，那种同步等待能把命令线程卡到十几秒）。
         #: 只在轮询线程里写、命令线程里读；每次整体替换一个 dict，靠 GIL 就够，不必再加锁。
         self._peer_snapshots: Dict[str, dict] = {}
+        #: 上次"因为对端广播了状态变化而立刻补刷"的时间（做 1 秒去抖用）
+        self._last_peer_refresh = 0.0
         self._self_name: Optional[str] = None
         #: 为什么认定"本实例负责这台服"（给 !!ig diag 展示，省得管理员猜）
         self._claim_reason: str = ''
@@ -1851,6 +1853,25 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         if not seen:
             return True
         return any(health.get('ok') for health in seen)
+
+    def note_peer_state_change(self) -> None:
+        """对端广播了状态变化（已休眠 / 已开启 / 正在启动）—— 立刻补一次对端查询。
+
+        状态表读的是心跳缓存，默认每 `sleep.state_tick` 秒（5 秒）才刷新一次：
+        对端刚休眠完，本实例最多会显示 5 秒的旧状态（"关完还显示运行中、开关还写着[休眠]"）。
+        对端的状态变化本来就会在总线上广播，收到就顺手补一次查询，显示与命令预检就能立刻跟上。
+
+        1 秒内最多补一次：广播可能连着来（启动中 → 已开启），别把对端问爆。
+        提交到探测线程池执行，所以既不阻塞总线连接线程，也不阻塞任何命令。
+        """
+        now = time.monotonic()
+        if now - self._last_peer_refresh < 1.0:
+            return
+        self._last_peer_refresh = now
+        try:
+            self._pool.submit(self._poll_peers)
+        except RuntimeError as exc:      # 线程池已经关了（插件正在卸载）
+            self._logger.debug(f'补刷对端状态时线程池已关闭：{exc}')
 
     def _poll_peers(self) -> None:
         """心跳里顺便问一句对端实例在不在。
