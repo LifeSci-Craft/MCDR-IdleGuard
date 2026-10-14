@@ -241,5 +241,11 @@
   "check.unowned.watch": "{server} has auto sleep on but its role is watch - no instance will ever stop it",
   "check.unowned.no_bus": "{server} uses role auto (expecting the MCDR whose port matches) but has no bus - that instance cannot find it",
   "check.peer.header": "-- peers (last probe) --",
-  "check.peer.none": "peers not probed yet: wait a few seconds (heartbeat) or run !!ig diag"
+  "check.peer.none": "peers not probed yet: wait a few seconds (heartbeat) or run !!ig diag",
+  "check.velocity.ok": "velocity.toml: read {path} ({count} servers)",
+  "check.velocity.disabled": "velocity.toml: sync is off (velocity.enabled = false)",
+  "check.velocity.not_found": "velocity.toml: not found (tried: {paths}) - set velocity.path in the config to point at it",
+  "check.velocity.missing_path": "velocity.toml: velocity.path does not exist: {path}",
+  "check.velocity.empty": "velocity.toml: read {path} but it has no usable [servers] entries",
+  "check.velocity.error": "velocity.toml: failed to read it, sync skipped (see the log)"
 }

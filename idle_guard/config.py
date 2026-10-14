@@ -15,6 +15,8 @@ from typing import Dict, List, Optional, Tuple
 
 from mcdreforged.api.utils import Serializable
 
+from .velocity import OFF_VALUES as VELOCITY_OFF_VALUES
+
 #: "服务端正在忙"的默认特征：常见备份插件的开始文案。
 #: 故意**不含**原版的 `Saving the game` —— 那是几十毫秒级的例行保存，
 #: 每次都延后一轮判定没有意义（真想拦它自己加进 busy_patterns 即可）。
@@ -83,7 +85,7 @@ def default_servers() -> List[ServerEntry]:
     """默认配置里带的示例子服。
 
     ⚠️ 这是**示例**，不是任何真实拓扑：某条若与这里逐字段相同，说明用户没改过它，
-    `velocity_config` 同步时可以按 velocity.toml 改写或删除
+    `velocity` 同步时可以按 velocity.toml 改写或删除
     （见 `Supervisor._sync_servers_from_velocity`）。改这里的值等于改判定基准，别只为换例子而改。
     """
     return [
@@ -140,6 +142,19 @@ class AnnounceConfig(Serializable):
 
 
 @dataclass
+class VelocityConfig(Serializable):
+    """从 Velocity 的 `velocity.toml` 同步子服清单。"""
+
+    #: 是否启用这个同步
+    enabled: bool = True
+    #: `velocity.toml` 的路径。`auto` = 在 MCDR 工作目录附近按候选路径查找；也可填相对路径
+    #: （相对 MCDR 工作目录）、绝对路径，支持 `~` 与环境变量。
+    #: 读到可用的 `[servers]` 时它是**子服清单的权威来源**：缺的子服补进来，
+    #: 默认配置里没改过的示例条目按它改写或删除；用户改过的条目一律不动（只提醒地址对不上）。
+    path: str = 'auto'
+
+
+@dataclass
 class Config(Serializable):
     #: 本实例名（用于日志与总线），auto = 用 role=self 的服务器名
     instance_name: str = 'auto'
@@ -180,11 +195,7 @@ class Config(Serializable):
     max_wake_failures: int = 3
     #: `!!ig sleep` 发出后，等多久之内可以用 `!!ig confirm` 确认（秒）
     confirm_timeout: float = 30.0
-    #: Velocity 配置文件（`velocity.toml`）的路径。
-    #: `auto` = 自动在 MCDR 工作目录附近查找；`off` / `''` = 关闭这个同步。
-    #: 打开且读到时，`[servers]` 段是**子服清单的权威来源**：缺的子服补进来，
-    #: 默认配置里没改过的示例条目按它改写或删除；用户改过的条目一律不动（只提醒地址对不上）。
-    velocity_config: str = 'auto'
+    velocity: VelocityConfig = field(default_factory=VelocityConfig)
     #: 服务端输出里命中这些正则时，认为它"正在忙"（备份 / 保存），这期间**不做自动休眠**。
     #: 只拦自动休眠：管理员手敲的 `!!ig sleep` 照常执行（你明确要关，插件不拦）。
     #: 默认覆盖常见的备份插件文案；不需要就把列表清空成 `[]`。
@@ -215,8 +226,8 @@ class Config(Serializable):
 
     @classmethod
     def deserialize(cls, data, **kwargs):
-        """读文件时先把分组摊平：分组的、平铺的老配置都能读。"""
-        return super().deserialize(_flatten_layout(data), **kwargs)
+        """读文件时先把分组摊平并迁移旧键：分组的、平铺的老配置都能读。"""
+        return super().deserialize(_migrate_legacy_velocity(_flatten_layout(data)), **kwargs)
 
 #: role 的合法取值
 VALID_ROLES = ('auto', 'self', 'command', 'watch')
@@ -247,8 +258,28 @@ CONFIG_LAYOUT: Dict[str, Tuple[str, ...]] = {
 CONFIG_FILE_ORDER: Tuple[str, ...] = (
     'instance_name', 'language', 'debug',
     'sleep', 'startup', 'announce', 'fake_server', 'bus',
-    'velocity_config', 'servers',
+    'velocity', 'servers',
 )
+
+
+def _migrate_legacy_velocity(data):
+    """旧配置里那个顶层 `velocity_config` 字符串 → 新的 `velocity` 分组。
+
+    旧写法一个字段三种含义（`auto` 查找 / `off` 关闭 / 其余当路径），新写法拆成
+    `velocity.enabled` + `velocity.path`。老配置照旧能读：关闭值转成"关闭"，
+    其余非空值转成路径；已经用新键的配置不受影响。
+    """
+    if not isinstance(data, dict) or 'velocity_config' not in data:
+        return data
+    legacy = str(data.pop('velocity_config') or '').strip()
+    bucket = data.get('velocity') if isinstance(data.get('velocity'), dict) else {}
+    if legacy.lower() in VELOCITY_OFF_VALUES:
+        bucket.setdefault('enabled', False)
+    elif legacy:
+        bucket.setdefault('path', legacy)
+    if bucket:
+        data['velocity'] = bucket
+    return data
 
 
 def _group_layout(flat: dict) -> dict:
