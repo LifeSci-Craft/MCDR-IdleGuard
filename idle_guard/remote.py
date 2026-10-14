@@ -28,6 +28,9 @@ class RemoteMixin:
                 player = str(message.get('player') or '')
                 self._play_local(player, str(message.get('sound') or ''))
                 return {'ok': True, 'delivered': self._has_player(player)}
+            # 对端在说某台子服的状态变了：立刻补一次对端查询，别等下一个心跳
+            # （默认 5 秒，这期间状态表会显示旧状态、开关列也跟着慢一拍）
+            self.note_peer_state_change()
             self._say_local(text)
             return {'ok': True}
         if mtype == 'state':
@@ -54,11 +57,15 @@ class RemoteMixin:
         managed = self._managed.get(name)
         not_managed = (False, self.tr('action.not_managed', server=name))
 
+        #: 这次请求有没有**真的动它**：对端回"已经开着了 / 不用再休眠了"时为 False，
+        #: 请求方据此直接回报对端原话，而不是去等一个永远不会发生的状态变化
+        changed = False
         if action in ('wake', 'sleep'):
             if managed is None:
                 ok, detail = not_managed
             elif managed.action_in_progress:
                 ok, detail = True, self.tr('action.accepted')
+                changed = True          # 已经有一次在进行，请求方继续等结果
             elif action == 'sleep':
                 # ⚠️ 先**同步**过一遍"现在到底能不能休眠"再转后台：
                 # 以前这里不检查、直接回"已受理"，`_can_sleep` 的拒绝只留在本实例日志里，
@@ -68,10 +75,13 @@ class RemoteMixin:
                 allowed, why_not = self.precheck_sleep(name)
                 if allowed:
                     ok, detail = self._sleep_in_background(name, reason='remote', by=by)
+                    changed = True
                 else:
                     ok, detail = False, why_not
                     self._logger.info(f'{name}: 拒绝休眠（remote，{by}）—— {why_not}')
             else:
+                # 已经在运行的服：wake_server 会回"已经开着了"，这次没真的动它
+                changed = managed.state != State.RUNNING
                 ok, detail = self.wake_server(name, reason='remote', by=by)
         elif action in ('lock', 'unlock'):
             if managed is None:
@@ -82,9 +92,10 @@ class RemoteMixin:
                     managed.wake_failures = 0
                 ok, detail = True, self.tr('action.locked' if managed.locked else 'action.unlocked',
                                            server=name)
+                changed = True
         else:
             ok, detail = False, self.tr('action.unknown_op', action=repr(action))
-        return {'ok': ok, 'reason': detail, 'instance': self.instance_name}
+        return {'ok': ok, 'reason': detail, 'instance': self.instance_name, 'changed': changed}
 
     def request_action(self, action: str, server: str, by: str = 'console',
                        wait: bool = False) -> Tuple[bool, str]:
@@ -121,7 +132,11 @@ class RemoteMixin:
         accepted = next((reply for reply in replies if reply.get('ok')), None)
         if accepted is not None:
             detail = str(accepted.get('reason') or self.tr('action.accepted'))
-            if not wait or action in ('lock', 'unlock'):
+            # 对端说"这次没真的动它"（已经开着了 / 不用再休眠了）：直接回报它的原话。
+            # 以前一律走进 `_wait_remote_state`，等状态变化再回一句统一的"已开启…" ——
+            # 更准确的答案被换掉了，管理员还会以为刚开过一次（端到端里就是这个现象）。
+            # 老版本对端不带这个字段，按"动了"处理（保持原行为）。
+            if not wait or action in ('lock', 'unlock') or accepted.get('changed') is False:
                 return True, detail
             return self._wait_remote_state(server, action, detail)
         if replies:

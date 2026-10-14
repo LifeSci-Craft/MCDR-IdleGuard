@@ -16,7 +16,7 @@ import time
 
 from idle_guard.config import AnnounceConfig, BusConfig, Config, FakeServerConfig, ServerEntry
 from idle_guard.supervisor import State, Supervisor
-from mc_test_utils import StubMCDR, free_port
+from mc_test_utils import StubMCDR, free_port, wait_until
 
 PEER_ADDRESS = '127.0.0.1:25601'
 
@@ -164,5 +164,50 @@ def test_a_failing_poll_backs_off_instead_of_retrying_every_tick(monkeypatch):
         assert counts['poll'] == 1, f'失败后没有退避，重试了 {counts["poll"]} 次'
         assert counts['tick'] >= 2, f'心跳没有照常跑：{counts}'
         assert '轮询时出现异常' in stub.logger.text()
+    finally:
+        supervisor.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# ③ 对端广播状态变化后立刻补刷（不等下一个心跳）
+
+def test_a_peer_announce_triggers_an_immediate_refresh():
+    """对端广播「已休眠 / 已开启」时，本实例要立刻补一次对端查询。
+
+    状态表读的是心跳缓存，默认每 `state_tick`（5 秒）才刷新一次 —— 端到端里的表现就是
+    "survival 已经休眠了，lobby 的状态表还写着运行中"，而且正好卡在刷新窗口的边界上（时好时坏）。
+    """
+    supervisor, _stub = build()
+    try:
+        calls: list = []
+        supervisor._poll_peers = lambda: calls.append(time.monotonic())
+        reply = supervisor._on_bus_message({'type': 'announce', 'kind': 'say',
+                                            'text': '服务器 survival 现已休眠'})
+        assert reply == {'ok': True}
+        assert wait_until(lambda: len(calls) == 1, 5), '收到广播后没有立刻补刷对端'
+        # 去抖：广播可能连着来（启动中 → 已开启），1 秒内别重复问对端
+        for _ in range(3):
+            supervisor._on_bus_message({'type': 'announce', 'kind': 'say', 'text': 'x'})
+        time.sleep(0.4)
+        assert len(calls) == 1, f'去抖没生效（{len(calls)} 次）'
+        time.sleep(1.1)
+        supervisor._on_bus_message({'type': 'announce', 'kind': 'say', 'text': 'y'})
+        assert wait_until(lambda: len(calls) == 2, 5), '过了去抖窗口应该还能再刷'
+    finally:
+        supervisor.shutdown()
+
+
+def test_player_targeted_announces_do_not_trigger_refreshes():
+    """只发给某个玩家的 announce（tell / sound）跟状态变化无关，不该补刷。"""
+    supervisor, _stub = build()
+    try:
+        calls: list = []
+        supervisor._poll_peers = lambda: calls.append(time.monotonic())
+        supervisor._on_bus_message({'type': 'announce', 'kind': 'tell',
+                                    'player': 'Steve', 'text': 'x'})
+        supervisor._on_bus_message({'type': 'announce', 'kind': 'sound',
+                                    'player': 'Steve', 'sound': 's'})
+        time.sleep(0.4)
+        assert calls == [], 'tell / sound 不该触发对端补刷'
     finally:
         supervisor.shutdown()
