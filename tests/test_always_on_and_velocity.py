@@ -242,6 +242,33 @@ def test_sync_can_be_switched_off(tmp_path, monkeypatch):
         supervisor.shutdown()
 
 
+def test_synced_servers_get_a_bus_automatically(tmp_path, monkeypatch):
+    """同步出来的条目要自带总线地址（按名字排序，各实例算出来一致），不能留 null。"""
+    supervisor, stub = _supervisor_in(tmp_path, monkeypatch, servers=[])
+    try:
+        by_name = {e.name: e for e in supervisor.config.servers}
+        assert by_name['Creative'].bus == '127.0.0.1:25600', '按名字排序：Creative 在前'
+        assert by_name['Survival'].bus == '127.0.0.1:25601'
+        assert all(e.bus for e in supervisor.config.servers), '不该留下没填 bus 的条目'
+        assert '已自动填入总线地址' in stub.logger.text(), stub.logger.text()
+        saved = json.loads((tmp_path / 'config.json').read_text(encoding='utf-8'))
+        assert all(e['bus'] for e in saved['servers']), saved['servers']
+    finally:
+        supervisor.shutdown()
+
+
+def test_a_user_written_bus_is_never_overwritten(tmp_path, monkeypatch):
+    """手填过的总线地址不动，自动分配的也要避开它。"""
+    mine = ServerEntry(name='Survival', host='127.0.0.1', port=30000, bus='127.0.0.1:25600')
+    supervisor, _stub = _supervisor_in(tmp_path, monkeypatch, servers=[mine])
+    try:
+        by_name = {e.name: e for e in supervisor.config.servers}
+        assert by_name['Survival'].bus == '127.0.0.1:25600', '手填的地址被改了'
+        assert by_name['Creative'].bus == '127.0.0.1:25601', '自动分配要避开已占用的端口'
+    finally:
+        supervisor.shutdown()
+
+
 def test_an_explicit_velocity_path_is_used(tmp_path, monkeypatch):
     """velocity.path 可以直接指定文件（相对 MCDR 工作目录的路径）。"""
     supervisor, _stub = _supervisor_in(
@@ -320,10 +347,10 @@ def test_a_sample_matching_velocity_is_rebuilt(tmp_path, monkeypatch):
     try:
         entry = next(e for e in supervisor.config.servers if e.name == 'survival')
         assert (entry.host, entry.port) == ('127.0.0.1', 30000), '示例的假端口没被 velocity 改写'
-        assert entry.bus is None, '示例里的假总线地址要清掉，否则看起来像已经配好了'
+        assert entry.bus == '127.0.0.1:25600', '重建出来的条目要自动带上总线地址'
         assert entry.role == 'auto' and entry.auto_sleep is True
         assert '已按 velocity.toml 改写示例条目' in stub.logger.text(), stub.logger.text()
-        assert 'bus 为空' in stub.logger.text(), '要提醒管理员填 bus'
+        assert '已自动填入总线地址' in stub.logger.text(), stub.logger.text()
     finally:
         supervisor.shutdown()
 

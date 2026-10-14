@@ -543,11 +543,18 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                 kept.append(ServerEntry(name=name, host=host, port=port))
                 added.append(name)
 
-        if not (dropped or refreshed or added):
+        # 自己生成的条目要带上总线地址：默认配置以前每条都有，空着我们同步出来就不好看也不可用。
+        # 只处理本次新增 / 重建的条目，用户手填的（包括特意留空的）一律不碰。
+        generated = {entry.name for entry in kept if entry.name in set(added) | set(refreshed)}
+        # 先把最终清单落定，再补地址：否则被删掉的示例条目（25600 / 25601）会被算成"已占用"，
+        # 新条目从 25602 起跳，日志与跨实例一致性都对不上。
+        self._config.servers = kept
+        filled = self._fill_missing_bus([entry for entry in kept if entry.name in generated])
+
+        if not (dropped or refreshed or added or filled):
             self._logger.debug(f'{os.path.basename(path)} 里的 {len(found)} 个子服都已在配置中')
             return
 
-        self._config.servers = kept
         if dropped:
             self._logger.info(
                 f'已删除默认配置里的示例条目：{", ".join(dropped)}（它们不在 {source} 中）'
@@ -556,6 +563,11 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             self._logger.info(f'已按 {source} 改写示例条目：{", ".join(refreshed)}')
         if added:
             self._logger.info(f'已从 {source} 补进 {len(added)} 个子服：{", ".join(added)}')
+        if filled:
+            self._logger.info(
+                f'已自动填入总线地址（127.0.0.1:25600 起，按名字排序）：{", ".join(filled)}；'
+                f'跨机器部署时把 IP 改成对方机器的'
+            )
         no_bus = [entry.name for entry in kept if entry.bus is None]
         if no_bus:
             self._logger.warning(
@@ -563,6 +575,31 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                 f'{", ".join(no_bus)}；用 !!ig check 看详情'
             )
         self._save_config()
+
+    def _fill_missing_bus(self, entries: List[ServerEntry]) -> List[str]:
+        """给这些条目自动补一个本机总线地址，返回 "名字 地址" 列表。
+
+        默认配置里每个子服都带 bus（lobby 25600 / survival 25601），而从 velocity.toml
+        同步进来的条目以前是 null —— 生成的配置看着像"没配好"，跨实例功能也确实用不了。
+        这里按**名字**排序取端口（不是配置顺序），这样同一台子服在每个实例上拿到的地址一致，
+        即使各实例 `servers` 的顺序不同也不会错位；已被占用的端口会跳过。
+        只填空值，且调用方只传"本次同步自己生成的条目"，用户手填或特意留空的都不动。
+        """
+        taken = {entry.bus for entry in self._config.servers if entry.bus}
+        filled: List[str] = []
+        port = 25600
+        for entry in sorted(entries, key=lambda item: item.name):
+            if entry.bus or port > 65535:
+                continue
+            while port <= 65535 and f'127.0.0.1:{port}' in taken:
+                port += 1
+            if port > 65535:
+                break
+            entry.bus = f'127.0.0.1:{port}'
+            taken.add(entry.bus)
+            filled.append(f'{entry.name} {entry.bus}')
+            port += 1
+        return filled
 
     def velocity_status(self) -> Dict[str, object]:
         """velocity.toml 同步的状态，供 `!!ig check` 回显（读了哪个文件、读到几个子服）。

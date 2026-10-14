@@ -91,7 +91,7 @@
 | `role` | `"auto"` | 由谁启停：`auto` 按端口自动判定 / `self` 用 MCDR 启停 / `command` 用命令启停 / `watch` 只监视 |
 | `auto_sleep` / `auto_wake` | `true` | 是否允许自动休眠 / 玩家连接时自动唤醒 |
 | `always_on` | `false` | 常驻：不自动休眠，也拒绝 `!!ig sleep` |
-| `bus` | `null` | 负责该子服的 MCDR 的总线地址；`null` = 只监视 |
+| `bus` | `null` | 负责该子服的 MCDR 的总线地址；同步生成的条目会自动填 `127.0.0.1:25600` 起（按名字排序），跨机器部署要改成对方 IP；`null` = 只监视 |
 | `start_command` / `stop_command` / `working_directory` | `null` | 仅 `role: command` 使用 |
 | `idle_timeout` | `null` | 覆盖 `sleep.idle_timeout`；`null` = 使用全局值 |
 
