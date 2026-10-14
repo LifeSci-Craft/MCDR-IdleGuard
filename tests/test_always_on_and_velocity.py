@@ -2,8 +2,9 @@
 
 - **常驻**：给"希望长期开着、不必休眠"的子服一个总开关。开了之后自动判定不关它，
   管理员手敲 `!!ig sleep`（包括从别的实例发来的）也会被直接拒绝。
-- **Velocity 同步**：Velocity 里已经写了每个子服的名字与地址，插件启动时读一遍，
-  把还没写进 `servers[]` 的补进来（已有条目一律不动，地址对不上只提醒）。
+- **Velocity 同步**：Velocity 里已经写了每个子服的名字与地址，插件启动时读一遍：
+  缺的补进来；默认配置里"一个字没改"的示例条目（lobby / survival）按它改写或删除；
+  用户改过的条目一律不动，地址对不上只提醒。
 """
 from __future__ import annotations
 
@@ -15,7 +16,8 @@ import pytest
 
 from idle_guard import commands as cmd_mod
 from idle_guard import velocity as velocity_mod
-from idle_guard.config import AnnounceConfig, BusConfig, Config, FakeServerConfig, ServerEntry
+from idle_guard.config import (AnnounceConfig, BusConfig, Config, FakeServerConfig, ServerEntry,
+                               VelocityConfig, default_servers)
 from idle_guard.mcproto import PingResult
 from idle_guard.supervisor import ServerView, State, Supervisor
 from mc_test_utils import StubMCDR, free_port, wait_until
@@ -176,10 +178,13 @@ def test_auto_mode_looks_next_to_the_mcdr_working_directory(tmp_path):
     assert velocity_mod.find_config(str(tmp_path)) == str(velocity_dir / 'velocity.toml')
 
 
-def _supervisor_in(tmp_path, monkeypatch, *, servers, velocity_config='auto'):
+def _supervisor_in(tmp_path, monkeypatch, *, servers, velocity_path='auto',
+                   velocity_enabled=True, toml=TOML, toml_rel='velocity.toml'):
     (tmp_path / 'server').mkdir(exist_ok=True)
     (tmp_path / 'server' / 'server.properties').write_text('server-port=30000\n', encoding='utf-8')
-    (tmp_path / 'velocity.toml').write_text(TOML, encoding='utf-8')
+    target = tmp_path / toml_rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(toml, encoding='utf-8')
     monkeypatch.chdir(tmp_path)
     config = Config(
         language='zh_cn',
@@ -187,7 +192,7 @@ def _supervisor_in(tmp_path, monkeypatch, *, servers, velocity_config='auto'):
         bus=BusConfig(bind=None, token='t'),
         fake_server=FakeServerConfig(enabled=False),
         announce=AnnounceConfig(enabled=False),
-        velocity_config=velocity_config,
+        velocity=VelocityConfig(enabled=velocity_enabled, path=velocity_path),
         servers=servers,
     )
     stub = StubMCDR()
@@ -229,10 +234,79 @@ def test_existing_entries_are_never_touched(tmp_path, monkeypatch):
 
 
 def test_sync_can_be_switched_off(tmp_path, monkeypatch):
-    supervisor, _stub = _supervisor_in(tmp_path, monkeypatch, servers=[], velocity_config='off')
+    supervisor, _stub = _supervisor_in(tmp_path, monkeypatch, servers=[], velocity_enabled=False)
     try:
         assert supervisor.config.servers == []
         assert not os.path.isfile(os.path.join(str(tmp_path), 'config.json')), '关掉后不该写配置'
+    finally:
+        supervisor.shutdown()
+
+
+def test_synced_servers_get_a_bus_automatically(tmp_path, monkeypatch):
+    """同步出来的条目要自带总线地址（按名字排序，各实例算出来一致），不能留 null。"""
+    supervisor, stub = _supervisor_in(tmp_path, monkeypatch, servers=[])
+    try:
+        by_name = {e.name: e for e in supervisor.config.servers}
+        assert by_name['Creative'].bus == '127.0.0.1:25600', '按名字排序：Creative 在前'
+        assert by_name['Survival'].bus == '127.0.0.1:25601'
+        assert all(e.bus for e in supervisor.config.servers), '不该留下没填 bus 的条目'
+        assert '已自动填入总线地址' in stub.logger.text(), stub.logger.text()
+        saved = json.loads((tmp_path / 'config.json').read_text(encoding='utf-8'))
+        assert all(e['bus'] for e in saved['servers']), saved['servers']
+    finally:
+        supervisor.shutdown()
+
+
+def test_a_user_written_bus_is_never_overwritten(tmp_path, monkeypatch):
+    """手填过的总线地址不动，自动分配的也要避开它。"""
+    mine = ServerEntry(name='Survival', host='127.0.0.1', port=30000, bus='127.0.0.1:25600')
+    supervisor, _stub = _supervisor_in(tmp_path, monkeypatch, servers=[mine])
+    try:
+        by_name = {e.name: e for e in supervisor.config.servers}
+        assert by_name['Survival'].bus == '127.0.0.1:25600', '手填的地址被改了'
+        assert by_name['Creative'].bus == '127.0.0.1:25601', '自动分配要避开已占用的端口'
+    finally:
+        supervisor.shutdown()
+
+
+def test_an_explicit_velocity_path_is_used(tmp_path, monkeypatch):
+    """velocity.path 可以直接指定文件（相对 MCDR 工作目录的路径）。"""
+    supervisor, _stub = _supervisor_in(
+        tmp_path, monkeypatch, servers=[],
+        toml_rel=os.path.join('conf', 'velocity.toml'),
+        velocity_path=os.path.join('conf', 'velocity.toml'),
+    )
+    try:
+        assert {e.name for e in supervisor.config.servers} == {'Survival', 'Creative'}
+        status = supervisor.velocity_status()
+        assert status['state'] == 'ok', status
+        assert str(status['path']).endswith(os.path.join('conf', 'velocity.toml'))
+    finally:
+        supervisor.shutdown()
+
+
+def test_a_wrong_explicit_path_is_reported(tmp_path, monkeypatch):
+    """路径填错时要说出来（以前是静默跳过，只能靠猜）。"""
+    supervisor, stub = _supervisor_in(
+        tmp_path, monkeypatch, servers=[],
+        toml_rel=os.path.join('elsewhere', 'velocity.toml'),
+        velocity_path=os.path.join('conf', 'velocity.toml'),
+    )
+    try:
+        assert supervisor.config.servers == [], '路径不存在时不该凭空同步出子服'
+        assert supervisor.velocity_status()['state'] == 'missing_path'
+        assert '不是一个存在的文件' in stub.logger.text(), stub.logger.text()
+    finally:
+        supervisor.shutdown()
+
+
+def test_check_shows_which_velocity_file_was_read(tmp_path, monkeypatch):
+    """`!!ig check` 要能看出读了哪个文件、读到几个子服。"""
+    from idle_guard import diag as diag_mod
+    supervisor, _stub = _supervisor_in(tmp_path, monkeypatch, servers=[])
+    try:
+        text = '\n'.join(row[0] for row in diag_mod.check_rows(supervisor))
+        assert 'velocity.toml：已读取' in text and '2 个子服' in text, text
     finally:
         supervisor.shutdown()
 
@@ -248,5 +322,52 @@ def test_sync_is_quiet_when_there_is_no_velocity_file(tmp_path, monkeypatch):
     supervisor = Supervisor(stub, config, plugin_version='test')
     try:
         assert supervisor.config.servers == []
+    finally:
+        supervisor.shutdown()
+
+
+def test_pristine_samples_are_replaced_by_velocity(tmp_path, monkeypatch):
+    """默认配置自带的 lobby / survival 只是示例，不该和真实清单混在一起。"""
+    supervisor, stub = _supervisor_in(tmp_path, monkeypatch, servers=default_servers())
+    try:
+        names = {entry.name for entry in supervisor.config.servers}
+        assert names == {'Survival', 'Creative'}, names
+        assert '已删除默认配置里的示例条目' in stub.logger.text(), stub.logger.text()
+        saved = json.loads((tmp_path / 'config.json').read_text(encoding='utf-8'))
+        assert {e['name'] for e in saved['servers']} == {'Survival', 'Creative'}
+    finally:
+        supervisor.shutdown()
+
+
+def test_a_sample_matching_velocity_is_rebuilt(tmp_path, monkeypatch):
+    """示例条目名与 velocity 里的名字一致时，整条按 velocity 重建（示例里的假 bus 要清掉）。"""
+    toml = '[servers]\nsurvival = "127.0.0.1:30000"\n'
+    sample = next(e for e in default_servers() if e.name == 'survival')
+    supervisor, stub = _supervisor_in(tmp_path, monkeypatch, servers=[sample], toml=toml)
+    try:
+        entry = next(e for e in supervisor.config.servers if e.name == 'survival')
+        assert (entry.host, entry.port) == ('127.0.0.1', 30000), '示例的假端口没被 velocity 改写'
+        assert entry.bus == '127.0.0.1:25600', '重建出来的条目要自动带上总线地址'
+        assert entry.role == 'auto' and entry.auto_sleep is True
+        assert '已按 velocity.toml 改写示例条目' in stub.logger.text(), stub.logger.text()
+        assert '已自动填入总线地址' in stub.logger.text(), stub.logger.text()
+    finally:
+        supervisor.shutdown()
+
+
+def test_edited_entries_and_extra_servers_survive_the_cleanup(tmp_path, monkeypatch):
+    """用户改过的条目、以及 velocity.toml 里没有的自建条目，都不能被删掉。"""
+    edited = ServerEntry(name='survival', host='10.0.0.9', port=12345, role='command',
+                         start_command='start.bat', bus='127.0.0.1:25601')
+    mine = ServerEntry(name='Mirror', host='127.0.0.1', port=30002, bus='127.0.0.1:25602')
+    sample = next(e for e in default_servers() if e.name == 'lobby')
+    supervisor, stub = _supervisor_in(tmp_path, monkeypatch, servers=[edited, mine, sample])
+    try:
+        by_name = {e.name: e for e in supervisor.config.servers}
+        assert set(by_name) == {'survival', 'Mirror', 'Survival', 'Creative'}, set(by_name)
+        assert (by_name['survival'].host, by_name['survival'].port) == ('10.0.0.9', 12345)
+        assert by_name['survival'].start_command == 'start.bat'
+        assert (by_name['Mirror'].host, by_name['Mirror'].port) == ('127.0.0.1', 30002)
+        assert 'lobby' not in by_name, '没改过的示例条目应该被删掉'
     finally:
         supervisor.shutdown()

@@ -33,7 +33,7 @@ from mcdreforged.api.types import PluginServerInterface
 from . import i18n
 from . import velocity as velocity_module
 from .bus import Bus, parse_address
-from .config import FAKE_SERVER_BIND, LEGACY_BUS_TOKEN, Config, ServerEntry
+from .config import FAKE_SERVER_BIND, LEGACY_BUS_TOKEN, Config, ServerEntry, default_servers
 from .mcproto import PingResult, bind_error, port_open, status_ping
 from .remote import RemoteMixin
 from .takeover import TakeoverMixin
@@ -79,6 +79,20 @@ def token_fingerprint(token: Optional[str]) -> str:
     """
     text = token or ''
     return hashlib.sha256(text.encode('utf-8')).hexdigest()[:8] if text else ''
+
+
+#: 迁移过的旧键：写回配置时不要再让它们长回来
+_LEGACY_CONFIG_KEYS: Tuple[str, ...] = ('velocity_config',)
+
+
+def _is_default_sample(entry: ServerEntry, template: Dict[str, ServerEntry]) -> bool:
+    """这一条是否还是默认配置里的示例（同名，且每个字段都与示例相同）。
+
+    只有"用户一个字没改"的示例条目才允许被 velocity.toml 改写或删除 ——
+    判据是逐字段相等：改过任何一格（哪怕只是端口）就不再算示例，自动同步不会碰它。
+    """
+    sample = template.get(entry.name)
+    return sample is not None and entry.serialize() == sample.serialize()
 
 
 def _read_json_object(path: str) -> dict:
@@ -460,44 +474,141 @@ class Supervisor(TakeoverMixin, RemoteMixin):
     # ================================================================== 配置解析
 
     def _sync_servers_from_velocity(self) -> None:
-        """按 `velocity.toml` 的 `[servers]` 段补齐子服清单（**只补缺的**）。
+        """按 `velocity.toml` 的 `[servers]` 段同步子服清单。
 
-        为什么只补不改：`servers[]` 里那些 `role` / `auto_sleep` / `bus` 是管理员按本机情况
-        手写的，自动同步不该动它们；地址对不上时只提醒一句，不覆盖。
+        读到可用的 `[servers]` 时，这份清单就是**权威来源**：
+
+        - 配置里缺的子服补进来；
+        - 默认配置自带、用户一个字没改的**示例**条目（`lobby` / `survival`）按它改写或删除 ——
+          否则真实清单会和这两条示例混在一起，而且示例的假端口还会挡住同名子服的真实地址；
+        - 用户改过的条目一律不动：`role` / `auto_sleep` / `bus` 是按本机情况手写的，
+          地址对不上时只提醒一句。
         """
-        setting = (self._config.velocity_config or '').strip()
+        if not self._config.velocity.enabled:
+            self._velocity_status = {'state': 'disabled'}
+            return
+        setting = (self._config.velocity.path or '').strip()
         if setting.lower() in velocity_module.OFF_VALUES:
+            self._velocity_status = {'state': 'disabled'}
             return
         try:
             path, found = velocity_module.load_servers(setting, os.getcwd())
         except Exception as exc:  # noqa: BLE001
+            self._velocity_status = {'state': 'error', 'error': f'{type(exc).__name__}: {exc}'}
             self._logger.warning(f'读取 Velocity 配置出错（跳过同步）：{type(exc).__name__}: {exc}')
             return
         if path is None:
-            self._logger.debug(f'没找到 velocity.toml（velocity_config={setting!r}），跳过子服同步')
+            if setting.lower() == 'auto':
+                self._velocity_status = {'state': 'not_found',
+                                         'candidates': list(velocity_module.DEFAULT_CANDIDATES)}
+                self._logger.debug('没找到 velocity.toml（用 !!ig check 看试过哪些路径），跳过子服同步')
+            else:
+                self._velocity_status = {'state': 'missing_path', 'path': setting}
+                self._logger.warning(f'velocity.path 填的 {setting!r} 不是一个存在的文件，跳过子服同步')
             return
         if not found:
+            self._velocity_status = {'state': 'empty', 'path': path}
             self._logger.info(f'读到了 {path}，但里面没有可用的 [servers] 条目，跳过同步')
             return
+        self._velocity_status = {'state': 'ok', 'path': path, 'count': len(found)}
 
-        known = {entry.name: entry for entry in self._config.servers}
+        template = {entry.name: entry for entry in default_servers()}
+        source = os.path.basename(path)
+        kept: List[ServerEntry] = []
+        dropped: List[str] = []
+        refreshed: List[str] = []
+        for entry in self._config.servers:
+            if _is_default_sample(entry, template):
+                address = found.get(entry.name)
+                if address is None:
+                    dropped.append(entry.name)
+                    continue
+                # 示例条目整条按 velocity.toml 重建：示例里的 bus 是编的，留着会看起来像配好了
+                entry = ServerEntry(name=entry.name, host=address[0], port=address[1])
+                refreshed.append(entry.name)
+            elif entry.name in found:
+                host, port = found[entry.name]
+                if entry.port != port or entry.host != host:
+                    self._logger.warning(
+                        f'配置里 {entry.name} 写的是 {entry.host}:{entry.port}，'
+                        f'而 {source} 里是 {host}:{port}；保留你的配置，'
+                        f'想跟着 Velocity 走就改掉这一条'
+                    )
+            kept.append(entry)
+
+        known = {entry.name for entry in kept}
         added: List[str] = []
         for name, (host, port) in sorted(found.items()):
-            entry = known.get(name)
-            if entry is None:
-                self._config.servers.append(ServerEntry(name=name, host=host, port=port))
+            if name not in known:
+                kept.append(ServerEntry(name=name, host=host, port=port))
                 added.append(name)
-            elif entry.port != port or entry.host != host:
-                self._logger.warning(
-                    f'配置里 {name} 写的是 {entry.host}:{entry.port}，'
-                    f'而 {os.path.basename(path)} 里是 {host}:{port}；保留你的配置，'
-                    f'想跟着 Velocity 走就改掉这一条'
-                )
-        if not added:
-            self._logger.debug(f'velocity.toml 里的 {len(found)} 个子服都已在配置中')
+
+        # 自己生成的条目要带上总线地址：默认配置以前每条都有，空着我们同步出来就不好看也不可用。
+        # 只处理本次新增 / 重建的条目，用户手填的（包括特意留空的）一律不碰。
+        generated = {entry.name for entry in kept if entry.name in set(added) | set(refreshed)}
+        # 先把最终清单落定，再补地址：否则被删掉的示例条目（25600 / 25601）会被算成"已占用"，
+        # 新条目从 25602 起跳，日志与跨实例一致性都对不上。
+        self._config.servers = kept
+        filled = self._fill_missing_bus([entry for entry in kept if entry.name in generated])
+
+        if not (dropped or refreshed or added or filled):
+            self._logger.debug(f'{os.path.basename(path)} 里的 {len(found)} 个子服都已在配置中')
             return
-        self._logger.info(f'已从 {path} 补进 {len(added)} 个子服：{", ".join(added)}')
+
+        if dropped:
+            self._logger.info(
+                f'已删除默认配置里的示例条目：{", ".join(dropped)}（它们不在 {source} 中）'
+            )
+        if refreshed:
+            self._logger.info(f'已按 {source} 改写示例条目：{", ".join(refreshed)}')
+        if added:
+            self._logger.info(f'已从 {source} 补进 {len(added)} 个子服：{", ".join(added)}')
+        if filled:
+            self._logger.info(
+                f'已自动填入总线地址（127.0.0.1:25600 起，按名字排序）：{", ".join(filled)}；'
+                f'跨机器部署时把 IP 改成对方机器的'
+            )
+        no_bus = [entry.name for entry in kept if entry.bus is None]
+        if no_bus:
+            self._logger.warning(
+                '这些子服还没指定负责它的实例（bus 为空），跨服通知与远程操作不可用：'
+                f'{", ".join(no_bus)}；用 !!ig check 看详情'
+            )
         self._save_config()
+
+    def _fill_missing_bus(self, entries: List[ServerEntry]) -> List[str]:
+        """给这些条目自动补一个本机总线地址，返回 "名字 地址" 列表。
+
+        默认配置里每个子服都带 bus（lobby 25600 / survival 25601），而从 velocity.toml
+        同步进来的条目以前是 null —— 生成的配置看着像"没配好"，跨实例功能也确实用不了。
+        这里按**名字**排序取端口（不是配置顺序），这样同一台子服在每个实例上拿到的地址一致，
+        即使各实例 `servers` 的顺序不同也不会错位；已被占用的端口会跳过。
+        只填空值，且调用方只传"本次同步自己生成的条目"，用户手填或特意留空的都不动。
+        """
+        taken = {entry.bus for entry in self._config.servers if entry.bus}
+        filled: List[str] = []
+        port = 25600
+        for entry in sorted(entries, key=lambda item: item.name):
+            if entry.bus or port > 65535:
+                continue
+            while port <= 65535 and f'127.0.0.1:{port}' in taken:
+                port += 1
+            if port > 65535:
+                break
+            entry.bus = f'127.0.0.1:{port}'
+            taken.add(entry.bus)
+            filled.append(f'{entry.name} {entry.bus}')
+            port += 1
+        return filled
+
+    def velocity_status(self) -> Dict[str, object]:
+        """velocity.toml 同步的状态，供 `!!ig check` 回显（读了哪个文件、读到几个子服）。
+
+        `state` 取值：`ok` / `disabled` / `not_found` / `missing_path` / `empty` / `error`；
+        还没跑过同步时是 `unknown`。
+        """
+        status = getattr(self, '_velocity_status', None)
+        return dict(status) if isinstance(status, dict) else {'state': 'unknown'}
 
     def _save_config(self) -> None:
         """把当前配置写回 config.json（自动补过子服时用，好让管理员看得见改动）。
@@ -511,6 +622,8 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         path = os.path.join(self._data_dir, 'config.json')
         try:
             payload = _merge_unknown_keys(_read_json_object(path), self._config.serialize())
+            for legacy in _LEGACY_CONFIG_KEYS:  # 已迁移掉的旧键，别让它又长回文件里
+                payload.pop(legacy, None)
             with open(path, 'w', encoding='utf-8') as handle:
                 json.dump(payload, handle, ensure_ascii=False, indent=4)
         except Exception as exc:  # noqa: BLE001

@@ -23,7 +23,7 @@
 
 ## 安装
 
-1. 从 [Releases](../../releases) 下载 `idle_guard-1.2.0.mcdr`，放进每个子服 MCDR 的 `plugins/` 目录
+1. 从 [Releases](../../releases) 下载 `idle_guard-1.2.1.mcdr`，放进每个子服 MCDR 的 `plugins/` 目录
 2. 执行 `!!MCDR plugin reload idle_guard`，或重启 MCDR
 3. 按下面的说明修改 `config/idle_guard/config.json` 的 `servers`
 4. 执行 `!!ig status` 查看各子服状态
@@ -73,7 +73,14 @@
 | `instance_name` | `"auto"` | 本实例名，用于日志与总线。`auto` = 使用本实例负责的子服名 |
 | `language` | `"auto"` | 界面语言。`auto` = 跟随 MCDR，也可填 `zh_cn` / `en_us` |
 | `debug` | `false` | 在控制台输出每轮侦察的详细日志 |
-| `velocity_config` | `"auto"` | 从 `velocity.toml` 补充子服清单；`"off"` = 关闭 |
+### `velocity`
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `velocity.enabled` | `true` | 是否从 `velocity.toml` 同步子服清单 |
+| `velocity.path` | `"auto"` | `velocity.toml` 的路径。`auto` = 在 MCDR 工作目录附近查找；也可填相对路径（相对 MCDR 工作目录）、绝对路径，支持 `~` 与环境变量 |
+
+同步结果（读了哪个文件、读到几个子服）可以用 `!!ig check` 查看。
 
 ### `servers[]`
 
@@ -84,7 +91,7 @@
 | `role` | `"auto"` | 由谁启停：`auto` 按端口自动判定 / `self` 用 MCDR 启停 / `command` 用命令启停 / `watch` 只监视 |
 | `auto_sleep` / `auto_wake` | `true` | 是否允许自动休眠 / 玩家连接时自动唤醒 |
 | `always_on` | `false` | 常驻：不自动休眠，也拒绝 `!!ig sleep` |
-| `bus` | `null` | 负责该子服的 MCDR 的总线地址；`null` = 只监视 |
+| `bus` | `null` | 负责该子服的 MCDR 的总线地址；同步生成的条目会自动填 `127.0.0.1:25600` 起（按名字排序），跨机器部署要改成对方 IP；`null` = 只监视 |
 | `start_command` / `stop_command` / `working_directory` | `null` | 仅 `role: command` 使用 |
 | `idle_timeout` | `null` | 覆盖 `sleep.idle_timeout`；`null` = 使用全局值 |
 
