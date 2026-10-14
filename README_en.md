@@ -94,7 +94,7 @@ its default.
 | `role` | `"auto"` | Who starts and stops it: `auto` by port / `self` through MCDR / `command` by command / `watch` watch only |
 | `auto_sleep` / `auto_wake` | `true` | Whether automatic sleeping / waking on player connect is allowed |
 | `always_on` | `false` | Always on: never slept automatically, and `!!ig sleep` is rejected |
-| `bus` | `null` | Bus address of the MCDR that owns it; `null` = watch only |
+| `bus` | `null` | Bus address of the MCDR that owns it; entries created by the sync get one automatically (`127.0.0.1:25600` upwards, ordered by name) - change the IP for a multi-machine setup; `null` = watch only |
 | `start_command` / `stop_command` / `working_directory` | `null` | Only used by `role: command` |
 | `idle_timeout` | `null` | Overrides `sleep.idle_timeout`; `null` = use the global value |
 
