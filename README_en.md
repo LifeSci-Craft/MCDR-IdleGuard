@@ -23,7 +23,7 @@ Cross-server notices and remote control require one MCDR instance per backend se
 
 ## Installation
 
-1. Download `idle_guard-1.2.0.mcdr` from [Releases](../../releases) and put it in the `plugins/` folder of every backend server's MCDR
+1. Download `idle_guard-1.2.1.mcdr` from [Releases](../../releases) and put it in the `plugins/` folder of every backend server's MCDR
 2. Run `!!MCDR plugin reload idle_guard`, or restart MCDR
 3. Edit `servers` in `config/idle_guard/config.json` (see below)
 4. Run `!!ig status` to check the state
@@ -76,7 +76,14 @@ its default.
 | `instance_name` | `"auto"` | Name of this instance, used in logs and on the bus. `auto` = the name of the server it owns |
 | `language` | `"auto"` | UI language. `auto` = follow MCDR, or set `zh_cn` / `en_us` |
 | `debug` | `false` | Print per-scan details to the console |
-| `velocity_config` | `"auto"` | Add servers from `velocity.toml`; `"off"` = disabled |
+### `velocity`
+
+| Option | Default | Description |
+|---|---|---|
+| `velocity.enabled` | `true` | Whether to sync the server list from `velocity.toml` |
+| `velocity.path` | `"auto"` | Path of `velocity.toml`. `auto` = look near the MCDR working directory; a relative path (to that directory) or an absolute path also works, with `~` and environment variables expanded |
+
+`!!ig check` shows which file was read and how many servers it contained.
 
 ### `servers[]`
 
@@ -87,7 +94,7 @@ its default.
 | `role` | `"auto"` | Who starts and stops it: `auto` by port / `self` through MCDR / `command` by command / `watch` watch only |
 | `auto_sleep` / `auto_wake` | `true` | Whether automatic sleeping / waking on player connect is allowed |
 | `always_on` | `false` | Always on: never slept automatically, and `!!ig sleep` is rejected |
-| `bus` | `null` | Bus address of the MCDR that owns it; `null` = watch only |
+| `bus` | `null` | Bus address of the MCDR that owns it; entries created by the sync get one automatically (`127.0.0.1:25600` upwards, ordered by name) - change the IP for a multi-machine setup; `null` = watch only |
 | `start_command` / `stop_command` / `working_directory` | `null` | Only used by `role: command` |
 | `idle_timeout` | `null` | Overrides `sleep.idle_timeout`; `null` = use the global value |
 

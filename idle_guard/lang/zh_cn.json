@@ -241,5 +241,11 @@
   "check.unowned.watch": "{server} 配了自动休眠，但 role 是 watch（只监视）—— 没有任何实例会去关它",
   "check.unowned.no_bus": "{server} 的 role 是 auto（期望由端口与它一致的那台 MCDR 负责），可那条没写 bus —— 负责它的实例找不到它",
   "check.peer.header": "-- 对端（最近一次探测）--",
-  "check.peer.none": "还没探测过对端：等几秒（心跳）后再看，或直接敲 !!ig diag"
+  "check.peer.none": "还没探测过对端：等几秒（心跳）后再看，或直接敲 !!ig diag",
+  "check.velocity.ok": "velocity.toml：已读取 {path}（{count} 个子服）",
+  "check.velocity.disabled": "velocity.toml：同步已关闭（velocity.enabled = false）",
+  "check.velocity.not_found": "velocity.toml：没找到（候选路径：{paths}）—— 想指定就在配置里填 velocity.path",
+  "check.velocity.missing_path": "velocity.toml：velocity.path 指向的文件不存在：{path}",
+  "check.velocity.empty": "velocity.toml：读到了 {path}，但没有可用的 [servers] 条目",
+  "check.velocity.error": "velocity.toml：读取时出错，已跳过同步（详见日志）"
 }

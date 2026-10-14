@@ -86,6 +86,31 @@ def _peer_rows(sup: Supervisor, *, when_empty: str = 'diag.peer.none') -> List[R
     return out
 
 
+def _velocity_rows(sup: Supervisor) -> List[Row]:
+    """`!!ig check` 里的 velocity 同步状态：读了哪个文件、读到几个子服。
+
+    没有这一行时，"为什么子服清单没同步"只能靠猜（是没找到文件、路径填错了，还是关掉了）。
+    """
+    tr = sup.tr
+    info = sup.velocity_status()
+    state = str(info.get('state') or 'unknown')
+    if state == 'ok':
+        return [(tr('check.velocity.ok', path=info.get('path'), count=info.get('count')),
+                 RColor.gray)]
+    if state == 'disabled':
+        return [(tr('check.velocity.disabled'), RColor.gray)]
+    if state == 'missing_path':
+        return [(tr('check.velocity.missing_path', path=info.get('path')), RColor.yellow)]
+    if state == 'empty':
+        return [(tr('check.velocity.empty', path=info.get('path')), RColor.yellow)]
+    if state == 'not_found':
+        return [(tr('check.velocity.not_found', paths=', '.join(info.get('candidates') or [])),
+                 RColor.yellow)]
+    if state == 'error':
+        return [(tr('check.velocity.error'), RColor.yellow)]
+    return []
+
+
 def check_rows(supervisor: Supervisor) -> List[Row]:
     """`!!ig check` 的内容：配置自检结果 + 对端最近一次探测。
 
@@ -106,6 +131,7 @@ def check_rows(supervisor: Supervisor) -> List[Row]:
     password_fingerprint = supervisor.bus_token_fingerprint()
     if password_fingerprint:
         out.append((tr('check.bus.token', fingerprint=password_fingerprint), RColor.gray))
+    out.extend(_velocity_rows(supervisor))
     out.append((tr('check.peer.header'), RColor.white))
     out.extend(_peer_rows(supervisor, when_empty='check.peer.none'))
     return out

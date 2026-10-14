@@ -40,7 +40,10 @@
         "token": "CHANGE_ME_填入与其他实例一致的随机串",
         "timeout": 3.0
     },
-    "velocity_config": "auto",
+    "velocity": {
+        "enabled": true,
+        "path": "auto"
+    },
     "servers": [
         {
             "name": "lobby",
