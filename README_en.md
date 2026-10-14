@@ -23,7 +23,7 @@ Cross-server notices and remote control require one MCDR instance per backend se
 
 ## Installation
 
-1. Download `idle_guard-1.2.0.mcdr` from [Releases](../../releases) and put it in the `plugins/` folder of every backend server's MCDR
+1. Download `idle_guard-1.2.1.mcdr` from [Releases](../../releases) and put it in the `plugins/` folder of every backend server's MCDR
 2. Run `!!MCDR plugin reload idle_guard`, or restart MCDR
 3. Edit `servers` in `config/idle_guard/config.json` (see below)
 4. Run `!!ig status` to check the state
