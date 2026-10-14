@@ -76,7 +76,14 @@ its default.
 | `instance_name` | `"auto"` | Name of this instance, used in logs and on the bus. `auto` = the name of the server it owns |
 | `language` | `"auto"` | UI language. `auto` = follow MCDR, or set `zh_cn` / `en_us` |
 | `debug` | `false` | Print per-scan details to the console |
-| `velocity_config` | `"auto"` | Sync servers from `velocity.toml` (it replaces the sample entries of the default config); `"off"` = disabled |
+### `velocity`
+
+| Option | Default | Description |
+|---|---|---|
+| `velocity.enabled` | `true` | Whether to sync the server list from `velocity.toml` |
+| `velocity.path` | `"auto"` | Path of `velocity.toml`. `auto` = look near the MCDR working directory; a relative path (to that directory) or an absolute path also works, with `~` and environment variables expanded |
+
+`!!ig check` shows which file was read and how many servers it contained.
 
 ### `servers[]`
 

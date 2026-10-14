@@ -73,7 +73,14 @@
 | `instance_name` | `"auto"` | 本实例名，用于日志与总线。`auto` = 使用本实例负责的子服名 |
 | `language` | `"auto"` | 界面语言。`auto` = 跟随 MCDR，也可填 `zh_cn` / `en_us` |
 | `debug` | `false` | 在控制台输出每轮侦察的详细日志 |
-| `velocity_config` | `"auto"` | 从 `velocity.toml` 同步子服清单（默认配置里的示例条目会被它替换）；`"off"` = 关闭 |
+### `velocity`
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `velocity.enabled` | `true` | 是否从 `velocity.toml` 同步子服清单 |
+| `velocity.path` | `"auto"` | `velocity.toml` 的路径。`auto` = 在 MCDR 工作目录附近查找；也可填相对路径（相对 MCDR 工作目录）、绝对路径，支持 `~` 与环境变量 |
+
+同步结果（读了哪个文件、读到几个子服）可以用 `!!ig check` 查看。
 
 ### `servers[]`
 

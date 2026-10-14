@@ -17,7 +17,7 @@ import pytest
 from idle_guard import commands as cmd_mod
 from idle_guard import velocity as velocity_mod
 from idle_guard.config import (AnnounceConfig, BusConfig, Config, FakeServerConfig, ServerEntry,
-                               default_servers)
+                               VelocityConfig, default_servers)
 from idle_guard.mcproto import PingResult
 from idle_guard.supervisor import ServerView, State, Supervisor
 from mc_test_utils import StubMCDR, free_port, wait_until
@@ -178,10 +178,13 @@ def test_auto_mode_looks_next_to_the_mcdr_working_directory(tmp_path):
     assert velocity_mod.find_config(str(tmp_path)) == str(velocity_dir / 'velocity.toml')
 
 
-def _supervisor_in(tmp_path, monkeypatch, *, servers, velocity_config='auto', toml=TOML):
+def _supervisor_in(tmp_path, monkeypatch, *, servers, velocity_path='auto',
+                   velocity_enabled=True, toml=TOML, toml_rel='velocity.toml'):
     (tmp_path / 'server').mkdir(exist_ok=True)
     (tmp_path / 'server' / 'server.properties').write_text('server-port=30000\n', encoding='utf-8')
-    (tmp_path / 'velocity.toml').write_text(toml, encoding='utf-8')
+    target = tmp_path / toml_rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(toml, encoding='utf-8')
     monkeypatch.chdir(tmp_path)
     config = Config(
         language='zh_cn',
@@ -189,7 +192,7 @@ def _supervisor_in(tmp_path, monkeypatch, *, servers, velocity_config='auto', to
         bus=BusConfig(bind=None, token='t'),
         fake_server=FakeServerConfig(enabled=False),
         announce=AnnounceConfig(enabled=False),
-        velocity_config=velocity_config,
+        velocity=VelocityConfig(enabled=velocity_enabled, path=velocity_path),
         servers=servers,
     )
     stub = StubMCDR()
@@ -231,10 +234,52 @@ def test_existing_entries_are_never_touched(tmp_path, monkeypatch):
 
 
 def test_sync_can_be_switched_off(tmp_path, monkeypatch):
-    supervisor, _stub = _supervisor_in(tmp_path, monkeypatch, servers=[], velocity_config='off')
+    supervisor, _stub = _supervisor_in(tmp_path, monkeypatch, servers=[], velocity_enabled=False)
     try:
         assert supervisor.config.servers == []
         assert not os.path.isfile(os.path.join(str(tmp_path), 'config.json')), '关掉后不该写配置'
+    finally:
+        supervisor.shutdown()
+
+
+def test_an_explicit_velocity_path_is_used(tmp_path, monkeypatch):
+    """velocity.path 可以直接指定文件（相对 MCDR 工作目录的路径）。"""
+    supervisor, _stub = _supervisor_in(
+        tmp_path, monkeypatch, servers=[],
+        toml_rel=os.path.join('conf', 'velocity.toml'),
+        velocity_path=os.path.join('conf', 'velocity.toml'),
+    )
+    try:
+        assert {e.name for e in supervisor.config.servers} == {'Survival', 'Creative'}
+        status = supervisor.velocity_status()
+        assert status['state'] == 'ok', status
+        assert str(status['path']).endswith(os.path.join('conf', 'velocity.toml'))
+    finally:
+        supervisor.shutdown()
+
+
+def test_a_wrong_explicit_path_is_reported(tmp_path, monkeypatch):
+    """路径填错时要说出来（以前是静默跳过，只能靠猜）。"""
+    supervisor, stub = _supervisor_in(
+        tmp_path, monkeypatch, servers=[],
+        toml_rel=os.path.join('elsewhere', 'velocity.toml'),
+        velocity_path=os.path.join('conf', 'velocity.toml'),
+    )
+    try:
+        assert supervisor.config.servers == [], '路径不存在时不该凭空同步出子服'
+        assert supervisor.velocity_status()['state'] == 'missing_path'
+        assert '不是一个存在的文件' in stub.logger.text(), stub.logger.text()
+    finally:
+        supervisor.shutdown()
+
+
+def test_check_shows_which_velocity_file_was_read(tmp_path, monkeypatch):
+    """`!!ig check` 要能看出读了哪个文件、读到几个子服。"""
+    from idle_guard import diag as diag_mod
+    supervisor, _stub = _supervisor_in(tmp_path, monkeypatch, servers=[])
+    try:
+        text = '\n'.join(row[0] for row in diag_mod.check_rows(supervisor))
+        assert 'velocity.toml：已读取' in text and '2 个子服' in text, text
     finally:
         supervisor.shutdown()
 

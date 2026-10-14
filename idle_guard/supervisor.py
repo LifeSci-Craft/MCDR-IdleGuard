@@ -81,6 +81,10 @@ def token_fingerprint(token: Optional[str]) -> str:
     return hashlib.sha256(text.encode('utf-8')).hexdigest()[:8] if text else ''
 
 
+#: 迁移过的旧键：写回配置时不要再让它们长回来
+_LEGACY_CONFIG_KEYS: Tuple[str, ...] = ('velocity_config',)
+
+
 def _is_default_sample(entry: ServerEntry, template: Dict[str, ServerEntry]) -> bool:
     """这一条是否还是默认配置里的示例（同名，且每个字段都与示例相同）。
 
@@ -480,20 +484,33 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         - 用户改过的条目一律不动：`role` / `auto_sleep` / `bus` 是按本机情况手写的，
           地址对不上时只提醒一句。
         """
-        setting = (self._config.velocity_config or '').strip()
+        if not self._config.velocity.enabled:
+            self._velocity_status = {'state': 'disabled'}
+            return
+        setting = (self._config.velocity.path or '').strip()
         if setting.lower() in velocity_module.OFF_VALUES:
+            self._velocity_status = {'state': 'disabled'}
             return
         try:
             path, found = velocity_module.load_servers(setting, os.getcwd())
         except Exception as exc:  # noqa: BLE001
+            self._velocity_status = {'state': 'error', 'error': f'{type(exc).__name__}: {exc}'}
             self._logger.warning(f'读取 Velocity 配置出错（跳过同步）：{type(exc).__name__}: {exc}')
             return
         if path is None:
-            self._logger.debug(f'没找到 velocity.toml（velocity_config={setting!r}），跳过子服同步')
+            if setting.lower() == 'auto':
+                self._velocity_status = {'state': 'not_found',
+                                         'candidates': list(velocity_module.DEFAULT_CANDIDATES)}
+                self._logger.debug('没找到 velocity.toml（用 !!ig check 看试过哪些路径），跳过子服同步')
+            else:
+                self._velocity_status = {'state': 'missing_path', 'path': setting}
+                self._logger.warning(f'velocity.path 填的 {setting!r} 不是一个存在的文件，跳过子服同步')
             return
         if not found:
+            self._velocity_status = {'state': 'empty', 'path': path}
             self._logger.info(f'读到了 {path}，但里面没有可用的 [servers] 条目，跳过同步')
             return
+        self._velocity_status = {'state': 'ok', 'path': path, 'count': len(found)}
 
         template = {entry.name: entry for entry in default_servers()}
         source = os.path.basename(path)
@@ -527,7 +544,7 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                 added.append(name)
 
         if not (dropped or refreshed or added):
-            self._logger.debug(f'velocity.toml 里的 {len(found)} 个子服都已在配置中')
+            self._logger.debug(f'{os.path.basename(path)} 里的 {len(found)} 个子服都已在配置中')
             return
 
         self._config.servers = kept
@@ -547,6 +564,15 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             )
         self._save_config()
 
+    def velocity_status(self) -> Dict[str, object]:
+        """velocity.toml 同步的状态，供 `!!ig check` 回显（读了哪个文件、读到几个子服）。
+
+        `state` 取值：`ok` / `disabled` / `not_found` / `missing_path` / `empty` / `error`；
+        还没跑过同步时是 `unknown`。
+        """
+        status = getattr(self, '_velocity_status', None)
+        return dict(status) if isinstance(status, dict) else {'state': 'unknown'}
+
     def _save_config(self) -> None:
         """把当前配置写回 config.json（自动补过子服时用，好让管理员看得见改动）。
 
@@ -559,6 +585,8 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         path = os.path.join(self._data_dir, 'config.json')
         try:
             payload = _merge_unknown_keys(_read_json_object(path), self._config.serialize())
+            for legacy in _LEGACY_CONFIG_KEYS:  # 已迁移掉的旧键，别让它又长回文件里
+                payload.pop(legacy, None)
             with open(path, 'w', encoding='utf-8') as handle:
                 json.dump(payload, handle, ensure_ascii=False, indent=4)
         except Exception as exc:  # noqa: BLE001
