@@ -80,7 +80,9 @@ def test_a_new_changelog_section_would_reach_the_artifact(tmp_path, monkeypatch)
         with zipfile.ZipFile(target) as archive:
             packed = archive.read(f'{build.PLUGIN_ID}/{build.CHANGELOG_NAME}').decode('utf-8')
         assert 'FAKE_SECTION_BODY' not in packed, '追加的历史条目原样进包了'
-        assert [line for line in packed.splitlines() if line.startswith('## ')] == ['## v1.2.2']
+        # 从元数据取期望的版本号，而不是写死一个：写死的话每次升版本都会在这里变红
+        assert [line for line in packed.splitlines() if line.startswith('## ')] == [
+            '## v{}'.format(build.read_version())]
     finally:
         # 绝不留下被改动的源码文件（这里不用 git，手写恢复）
         with open(changelog, 'wb') as handle:

@@ -1,6 +1,6 @@
 {
   "id": "idle_guard",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "name": "Idle Guard",
   "description": {
     "zh_cn": "Velocity 群组服子服务器空闲守卫：持续无人自动休眠、玩家连接自动唤醒、支持跨服通知与状态查询",
