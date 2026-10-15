@@ -23,7 +23,7 @@
 
 ## 安装
 
-1. 从 [Releases](../../releases) 下载 `idle_guard-1.2.2.mcdr`，放进每个子服 MCDR 的 `plugins/` 目录
+1. 从 [Releases](../../releases) 下载 `idle_guard-1.2.3.mcdr`，放进每个子服 MCDR 的 `plugins/` 目录
 2. 执行 `!!MCDR plugin reload idle_guard`，或重启 MCDR
 3. 按下面的说明修改 `config/idle_guard/config.json` 的 `servers`
 4. 执行 `!!ig status` 查看各子服状态
@@ -73,6 +73,10 @@
 | `instance_name` | `"auto"` | 本实例名，用于日志与总线。`auto` = 使用本实例负责的子服名 |
 | `language` | `"auto"` | 界面语言。`auto` = 跟随 MCDR，也可填 `zh_cn` / `en_us` |
 | `debug` | `false` | 在控制台输出每轮侦察的详细日志 |
+
+下表里的选项名**就是配置文件里的完整路径**（例如 `sleep.idle_timeout`），
+照着抄即可；`servers[]` 那一张是条目内的字段名。
+
 ### `velocity`
 
 | 选项 | 默认 | 说明 |
@@ -101,34 +105,34 @@
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `idle_timeout` | `3600` | 连续无人多少秒后休眠 |
-| `min_uptime` | `300` | 启动保护期（秒）：服务端就绪后这段时间内不判定空闲 |
-| `check_interval` | `600` | 侦察间隔（秒） |
-| `state_tick` | `5` | 状态心跳间隔（秒），用于快速刷新状态；`0` = 关闭 |
-| `wake_cooldown` | `15` | 玩家连接触发的两次唤醒之间的最小间隔（秒） |
-| `confirm_timeout` | `30` | `!!ig confirm` 的有效期（秒） |
-| `busy_patterns` | 备份类正则 | 服务端输出命中时暂停自动休眠；`[]` = 关闭 |
-| `busy_hold_seconds` | `300` | 命中一次后多少秒内不自动休眠 |
-| `ignore_players` | `[]` | 统计人数时忽略的玩家名（正则），例如假人 |
+| `sleep.idle_timeout` | `3600` | 连续无人多少秒后休眠 |
+| `sleep.min_uptime` | `300` | 启动保护期（秒）：服务端就绪后这段时间内不判定空闲 |
+| `sleep.check_interval` | `600` | 侦察间隔（秒） |
+| `sleep.state_tick` | `5` | 状态心跳间隔（秒），用于快速刷新状态。**正数最小 0.2 秒**（写 0.1 实际按 0.2 跑）；`0` 或负数 = 关闭心跳 |
+| `sleep.wake_cooldown` | `15` | 玩家连接触发的两次唤醒之间的最小间隔（秒） |
+| `sleep.confirm_timeout` | `30` | `!!ig confirm` 的有效期（秒）。**最小值 5 秒**（写 2 实际给到 5 秒） |
+| `sleep.busy_patterns` | 备份类正则 | 服务端输出命中时暂停自动休眠；`[]` = 关闭 |
+| `sleep.busy_hold_seconds` | `300` | 命中一次后多少秒内不自动休眠 |
+| `sleep.ignore_players` | `[]` | 统计人数时忽略的玩家名（正则），例如假人 |
 
 ### `startup`
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `startup_timeout` / `stop_timeout` | `300` / `180` | 等待启动就绪 / 等待停止的上限（秒） |
-| `port_release_timeout` | `60` | 等待端口可绑定的上限（秒） |
-| `fallback_startup_seconds` | `60` | 尚无实测启动耗时时报给玩家的预计值（秒） |
-| `hot_startup_window` | `300` | 热启动判定窗口（秒）：停止后这段时间内又被唤醒算热启动 |
-| `max_wake_failures` | `3` | 连续启动失败多少次后锁定自动唤醒 |
+| `startup.startup_timeout` / `startup.stop_timeout` | `300` / `180` | 等待启动就绪 / 等待停止的上限（秒） |
+| `startup.port_release_timeout` | `60` | 同步等待端口释放的预算（秒）：自动休眠路径实际取 `min(该值, 30)`，手动休眠路径取 `min(该值, 5)`。超时**并不是放弃** —— 转入后台持续重试（每 0.25 秒一次，最多 5 分钟后放弃并记一条 warning），这期间玩家连接仍会被拒绝。因此大于 30 不再有额外效果 |
+| `startup.fallback_startup_seconds` | `60` | 尚无实测启动耗时时报给玩家的预计值（秒） |
+| `startup.hot_startup_window` | `300` | 热启动判定窗口（秒）：停止后这段时间内又被唤醒算热启动 |
+| `startup.max_wake_failures` | `3` | 连续启动失败多少次后锁定自动唤醒 |
 
 ### `announce`
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `enabled` | `true` | 是否广播「已休眠」与「已开启」 |
-| `tell_attempt_players` | `true` | 是否单独提醒被挡回的玩家 |
-| `sound` | `minecraft:block.note_block.pling` | 提醒音效；空字符串 = 不播放 |
-| `player_attempt_window` | `600` | 记录「谁被挡回过」的时长（秒） |
+| `announce.enabled` | `true` | 是否广播「已休眠」与「已开启」 |
+| `announce.tell_attempt_players` | `true` | 是否单独提醒被挡回的玩家 |
+| `announce.sound` | `minecraft:block.note_block.pling` | 提醒音效；空字符串 = 不播放 |
+| `announce.player_attempt_window` | `600` | 记录「谁被挡回过」的时长（秒） |
 
 ### `fake_server` / `bus`
 

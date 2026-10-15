@@ -12,28 +12,64 @@ from __future__ import annotations
 import time
 from typing import Optional, Tuple
 
-from .models import ServerView, State
+from .models import ServerView, State, safe_player_name, safe_sound_id
 
 
 class RemoteMixin:
+    def _mark_sender_alive(self, message: dict) -> None:
+        """对端主动发来一条消息 = 它刚刚还活着，顺手刷新它的健康度。
+
+        为什么要在这里做：对端健康度以前只有一个来源（心跳的 `_poll_peers`），而心跳
+        （`state_tick`）可以被配置关掉；`live_views` 里那条 "刚通过话才算心跳" 的分支
+        读的是缓存里的 `fresh_probe`，而缓存写入时那个标志恒为 False —— 等于死代码
+        （IG-A-12）。现在真正的"刚通过话"信号就是这条入站消息本身：消息里带上了对端的
+        实例名（新版本对端才会带，老版本不带就不动，保持原行为）。
+        """
+        instance = message.get('instance')
+        if isinstance(instance, str) and instance:
+            self._mark_peer_alive(instance)
+
     def _on_bus_message(self, message: dict) -> Optional[dict]:
         mtype = message.get('type')
         if mtype == 'announce':
+            self._mark_sender_alive(message)
+            kind = message.get('kind')
+            if kind == 'state':
+                # 对端只是说"我这台子服的状态变了"：与玩家可见文案无关的独立通道
+                # （announce.enabled 为假时 `_announce` 直接 return，以前连这条广播都没有，
+                #  于是 state_tick ≤ 0 的实例上对端快照再没有更新来源）
+                self.note_peer_state_change()
+                return {'ok': True}
             text = str(message.get('text') or '')
-            if message.get('kind') == 'tell':
+            if kind == 'tell':
                 player = str(message.get('player') or '')
                 self._tell_local(player, text)
                 return {'ok': True, 'delivered': self._has_player(player)}
-            if message.get('kind') == 'sound':
+            if kind == 'sound':
                 player = str(message.get('player') or '')
-                self._play_local(player, str(message.get('sound') or ''))
-                return {'ok': True, 'delivered': self._has_player(player)}
+                sound = str(message.get('sound') or '')
+                # ⚠️ player 与 sound 都是**对端给的字符串**，而它们会被拼进
+                # `execute at P run playsound SOUND ...` 交给服务端控制台执行 ——
+                # 换行即第二条控制台命令。所以这里先过一遍本地同款守卫再落命令；
+                # 故意**不**调 play_sound()：那会把同一条音效再广播回对端，
+                # 两台实例互发就成了消息风暴（_say_local / _tell_local 同理）。
+                safe_player = safe_player_name(player)
+                if not safe_player or not safe_sound_id(sound):
+                    self._logger.warning(
+                        f'丢弃对端发来的音效请求（玩家名或音效 id 不合法）：'
+                        f'player={player!r} sound={sound!r}'
+                    )
+                    return {'ok': True, 'delivered': False}
+                self._play_local(safe_player, sound)
+                return {'ok': True, 'delivered': self._has_player(safe_player)}
             # 对端在说某台子服的状态变了：立刻补一次对端查询，别等下一个心跳
             # （默认 5 秒，这期间状态表会显示旧状态、开关列也跟着慢一拍）
             self.note_peer_state_change()
             self._say_local(text)
             return {'ok': True}
         if mtype == 'state':
+            # 对端在**主动**问我们的状态：这就是一次"刚通过话"，顺手刷新它的健康度
+            self._mark_sender_alive(message)
             return {
                 'ok': True,
                 'instance': self.instance_name,

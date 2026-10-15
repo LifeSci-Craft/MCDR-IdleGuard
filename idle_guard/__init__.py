@@ -23,7 +23,7 @@ from .config import Config
 from .supervisor import Supervisor, token_fingerprint
 
 PLUGIN_ID = 'idle_guard'
-PLUGIN_VERSION = '1.2.2'
+PLUGIN_VERSION = '1.2.3'
 
 _supervisor: Optional[Supervisor] = None
 

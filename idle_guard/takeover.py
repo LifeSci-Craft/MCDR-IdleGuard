@@ -183,7 +183,7 @@ class TakeoverMixin:
         return False
 
     def _ensure_takeover_retry(self, managed: ManagedServer) -> None:
-        """起一个后台线程，每 0.25 秒试一次，直到假服务端接管端口（或被唤醒）。"""
+        """起一个后台线程，按退避序列试到假服务端接管端口（有总时长上限，见 _takeover_retry_loop）。"""
         if self._stopping.is_set():
             return
         if not self._config.fake_server.enabled or not managed.entry.auto_wake:
@@ -191,6 +191,10 @@ class TakeoverMixin:
         alive = managed.takeover_thread is not None and managed.takeover_thread.is_alive()
         if alive:
             return
+        # 让状态表 / 诊断页能看出"这一条正在后台抢端口"，而不是只显示一个"未运行"
+        # （这条文案以前是零引用的死键）
+        if managed.state == State.OFFLINE:
+            self._set_state(managed, State.OFFLINE, self.tr('detail.takeover_retrying'))
         managed.takeover_thread = threading.Thread(
             target=self._takeover_retry_loop,
             args=(managed,),

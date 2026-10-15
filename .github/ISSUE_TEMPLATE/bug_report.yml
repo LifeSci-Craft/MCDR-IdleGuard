@@ -1,0 +1,105 @@
+name: 问题反馈
+description: 插件行为不对、报错或与预期不符
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        报障时最有用的是这三样：**版本**、**日志**、**复现步骤**。缺日志的报障通常只能来回问。
+
+        Idle Guard 是多实例插件，"谁负责哪台子服"由配置与端口自动判定 —— 所以请把
+        `!!ig check` 与 `!!ig diag` 的输出一起贴上：前者说配置有没有毛病，后者说运行时
+        认为谁在管谁。少了这两屏，多数问题只能靠猜。
+  - type: input
+    id: mcdr-version
+    attributes:
+      label: MCDR 版本
+      description: 控制台启动时打印的版本号，或 `!!MCDR version` 的输出
+      placeholder: 例如 2.16.0
+    validations:
+      required: true
+  - type: input
+    id: plugin-version
+    attributes:
+      label: 插件版本
+      description: 产物文件名里的版本，或 `!!ig diag` 第一行里的版本
+      placeholder: 例如 1.2.2
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: Python 版本
+      description: MCDR 用的那个 Python（`python -V`），或 `!!ig diag` 第一行里的 Python 版本
+      placeholder: 例如 3.13.14
+    validations:
+      required: true
+  - type: input
+    id: instances
+    attributes:
+      label: 实例数量与拓扑
+      description: 一共几个 MCDR 实例、每台子服由谁启停（`role` 的组合），例如"2 个实例，都是 role=auto"
+      placeholder: 例如 2 个实例；Survival role=auto，Creative role=command（同一台 MCDR 用命令启停）
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 期望的行为与实际的行为
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 越具体越好；涉及"该休眠却没休眠 / 该唤醒却没唤醒"时，请写清当时那台服上有没有人
+      placeholder: |
+        1. `!!ig sleep Survival` 后 `!!ig confirm`
+        2. 状态表显示 ...
+        3. 用客户端连接该端口，看到的是 ...
+    validations:
+      required: true
+  - type: dropdown
+    id: fake-server
+    attributes:
+      label: 能否用假服务端（休眠占位）复现
+      description: 如果能稳定复现，多半是假服务端 / 端口接管这一层，而不是唤醒链路
+      options:
+        - 能（直接连游戏端口就能看到提示或连接被拒）
+        - 不能（只有真实服务端在跑时才出问题）
+        - 不确定 / 没试过
+    validations:
+      required: false
+  - type: textarea
+    id: check-output
+    attributes:
+      label: "`!!ig check` 的输出"
+      description: 配置自检（总线、地址冲突、端口范围、没人管的子服）—— 多实例问题九成能从这一屏看出来
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: diag-output
+    attributes:
+      label: "`!!ig diag` 的输出"
+      description: 它包含认领依据、总线与对端健康度、每台服的休眠预检结论与最近事件
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: 相关配置
+      description: "`config/idle_guard/config.json` 里与本次报障有关的部分（**贴之前把 bus.token 换成 xxxxxxxx**）"
+      render: json
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: MCDR 控制台输出或 `logs/MCDR.log` 里的相关片段，包含完整 traceback（如果有）
+      render: text
+    validations:
+      required: true

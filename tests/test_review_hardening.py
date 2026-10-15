@@ -199,11 +199,14 @@ def test_the_probe_pool_is_created_once_not_per_tick(monkeypatch):
     monkeypatch.setattr(supervisor_module.concurrent.futures, 'ThreadPoolExecutor', counting)
     supervisor, _stub = build()
     try:
-        assert len(created) == 1, '构造时就该建好那一个池'
+        # 两个常驻池：状态探测与对端探测分开（IG-A-02 —— 共用一个池时，对端探测会把
+        # 状态查询饿死，as_completed 超时后整轮侦察全丢）。两者都必须在构造时建好。
+        assert len(created) == 2, '构造时就该建好那两把常驻池'
+        assert supervisor._pool is not supervisor._peer_pool
         monkeypatch.setattr(supervisor_module, 'status_ping', lambda *a, **k: PingResult())
         supervisor._tick_states()
         supervisor._ping_all()
-        assert len(created) == 1, f'心跳/侦察又新建了 {len(created) - 1} 个线程池'
+        assert len(created) == 2, f'心跳/侦察又新建了 {len(created) - 2} 个线程池'
     finally:
         supervisor.shutdown()
 
@@ -213,6 +216,8 @@ def test_shutdown_closes_the_probe_pool():
     supervisor.shutdown()
     with pytest.raises(RuntimeError):
         supervisor._pool.submit(lambda: None)
+    with pytest.raises(RuntimeError):
+        supervisor._peer_pool.submit(lambda: None)
 
 
 # --------------------------------------------------------------------------- #

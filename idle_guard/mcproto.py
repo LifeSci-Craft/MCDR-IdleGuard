@@ -119,8 +119,32 @@ def parse_string(data: bytes, offset: int = 0) -> Tuple[str, int]:
     return data[offset:offset + length].decode('utf-8', errors='replace'), offset + length
 
 
-def component_to_text(component: Any) -> str:
-    """把聊天组件（str / dict / list）压平成纯文本，用于日志和展示。"""
+#: 聊天组件的最大展开深度。原版组件的嵌套通常不到 5 层，给 32 层足够宽松；
+#: 而畸形报文可以嵌套上千层，让 `component_to_text` 直接 RecursionError。
+MAX_COMPONENT_DEPTH = 32
+
+
+def _as_int(value: Any, default: int = -1) -> int:
+    """把报文里的字段转成 int；类型不对（null / 列表 / 对象 / inf）时退回 default。
+
+    以前直接 `int(...)`：`players.online: null` 这类畸形报文会抛 **TypeError**，
+    而它不在 `status_ping` 的 except 列表里 —— 从 `_wait_ready` 那条路径直接漏进唤醒线程，
+    状态永久停在"启动中"（服务端其实早就开好了）。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def component_to_text(component: Any, depth: int = 0) -> str:
+    """把聊天组件（str / dict / list）压平成纯文本，用于日志和展示。
+
+    `depth` 是内部参数（调用方不用传）：超过 `MAX_COMPONENT_DEPTH` 就不再往下递归，
+    免得畸形报文把栈打爆。
+    """
+    if depth > MAX_COMPONENT_DEPTH:
+        return ''
     if component is None:
         return ''
     if isinstance(component, str):
@@ -128,16 +152,16 @@ def component_to_text(component: Any) -> str:
     if isinstance(component, (int, float, bool)):
         return str(component)
     if isinstance(component, list):
-        return ''.join(component_to_text(item) for item in component)
+        return ''.join(component_to_text(item, depth + 1) for item in component)
     if isinstance(component, dict):
         pieces: List[str] = []
         if 'text' in component:
-            pieces.append(component_to_text(component['text']))
+            pieces.append(component_to_text(component['text'], depth + 1))
         elif 'translate' in component:
             pieces.append(str(component.get('translate', '')))
         for key in ('with', 'extra'):
             if key in component:
-                pieces.append(component_to_text(component[key]))
+                pieces.append(component_to_text(component[key], depth + 1))
         return ''.join(pieces)
     return str(component)
 
@@ -186,10 +210,15 @@ class ConnReader:
             if shift > 35:
                 raise ValueError('VarInt 过长')
 
-    def read_packet(self) -> Tuple[int, bytes]:
-        """读取一个完整数据包，返回 (包 ID, 负载字节)。"""
+    def read_packet(self, max_length: int = MAX_PACKET_LENGTH) -> Tuple[int, bytes]:
+        """读取一个完整数据包，返回 (包 ID, 负载字节)。
+
+        ``max_length`` 是**这一包**的长度上限。默认仍是协议上限 2 MiB，但对外且未鉴权的
+        读取路径（假服务端的第一条握手）会传一个小得多的值 —— 只信长度前缀就等于让任何
+        能连上端口的人要求我们准备 2 MiB 缓冲（见 fakeserver.MAX_CLIENT_PACKET_LENGTH）。
+        """
         length = self.read_varint()
-        if length <= 0 or length > MAX_PACKET_LENGTH:
+        if length <= 0 or length > max_length:
             raise ValueError(f'非法的包长度: {length}')
         data = self.read_exact(length)
         packet_id, offset = decode_varint(data, 0)
@@ -230,6 +259,8 @@ def status_ping(host: str, port: int, timeout: float = 3.0) -> PingResult:
     """对 host:port 做一次状态查询。
 
     任何异常都会转成 online=False 的结果，不会向外抛出（轮询场景下不希望线程崩掉）。
+    "任何"包括 OverflowError：端口越界（配置里写错）时 `create_connection` 抛的是它，
+    而不是 OSError —— 漏掉它就会从 `_wait_ready` 那条路径直接漏进唤醒线程。
     """
     started = time.monotonic()
     try:
@@ -261,8 +292,13 @@ def status_ping(host: str, port: int, timeout: float = 3.0) -> PingResult:
             latency_ms = (time.monotonic() - started) * 1000.0
             players = raw.get('players') if isinstance(raw.get('players'), dict) else {}
             version = raw.get('version') if isinstance(raw.get('version'), dict) else {}
+            # `sample` 不一定是列表（畸形报文里可以是数字 / 对象 / null）：
+            # 直接迭代非列表会抛 TypeError，与下面的 int() 是同一类问题
+            raw_sample = players.get('sample')
+            if not isinstance(raw_sample, list):
+                raw_sample = []
             sample_names = [
-                item.get('name', '') for item in (players.get('sample') or [])
+                item.get('name', '') for item in raw_sample
                 if isinstance(item, dict)
             ]
 
@@ -273,21 +309,26 @@ def status_ping(host: str, port: int, timeout: float = 3.0) -> PingResult:
                 pong_id, _ = reader.read_packet()
                 if pong_id == 0x01:
                     latency_ms = (time.monotonic() - started) * 1000.0
-            except (OSError, ValueError, ConnectionError):
+            except (OSError, ValueError, ConnectionError, OverflowError):
                 pass
 
             return PingResult(
                 online=True,
-                players_online=int(players.get('online', -1)),
-                players_max=int(players.get('max', -1)),
+                players_online=_as_int(players.get('online'), -1),
+                players_max=_as_int(players.get('max'), -1),
                 sample=sample_names,
                 version_name=str(version.get('name', '')),
-                protocol=int(version.get('protocol', -1)),
+                protocol=_as_int(version.get('protocol'), -1),
                 motd=component_to_text(raw.get('description')),
                 latency_ms=latency_ms,
                 raw=raw,
             )
-    except (OSError, ValueError, ConnectionError) as exc:
+    except Exception as exc:  # noqa: BLE001
+        # ⚠️ 这里刻意是 Exception 而不是 `(OSError, ValueError, ConnectionError)`：
+        # 本函数的契约是"任何异常都转成 online=False"。畸形状态 JSON 能造出 TypeError
+        # （players.online 是 null）、RecursionError（description 嵌套上千层）等，
+        # 而它们以前会从这个唯一的出口漏出去 —— 调用方 `_wait_ready` 跑在唤醒线程里，
+        # 表现是"这台服永远显示启动中、!!ig sleep 被拒、自动休眠失效"，日志里一句都没有。
         return PingResult(online=False, error=f'{type(exc).__name__}: {exc}')
 
 
@@ -296,12 +337,14 @@ def port_open(host: str, port: int, timeout: float = 1.0) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
-    except OSError:
+    except (OSError, OverflowError, ValueError):
+        # OverflowError：端口超出 0..65535（配置里写错一个数）。这里绝不能让它冒出去 ——
+        # 它既不是 OSError、也不会被上层的 `except OSError` 接住，一条坏配置就会打断整轮侦察。
         return False
 
 
-def bind_error(host: str, port: int) -> Optional[OSError]:
-    """试着在本机绑定该端口：能绑返回 None，不能绑则返回那个 OSError（带 errno 便于排查）。
+def bind_error(host: str, port: int) -> Optional[Exception]:
+    """试着在本机绑定该端口：能绑返回 None，不能绑则返回那个异常（带 errno 便于排查）。
 
     ⚠️ 这个结果**不能**拿来判断「端口空出来了吗」：端口上只要残留一条 TIME_WAIT
     （每次客户端正常断开都会留下一条），bind 就会报 EADDRINUSE —— 实测在 POSIX 上
@@ -311,6 +354,10 @@ def bind_error(host: str, port: int) -> Optional[OSError]:
 
     POSIX 上仍然设 SO_REUSEADDR，与 `fakeserver` / `bus` 保持一致；Windows 上不设 ——
     那边的语义是"允许抢一个正在监听的端口"，会让探测恒为"能绑"。
+
+    返回类型从 `Optional[OSError]` 放宽到 `Optional[Exception]`：端口越界（例如配置里写了
+    999999）抛的是 **OverflowError**，而它才是"到底哪里不对"的唯一线索 —— 以前它不在
+    except 列表里，于是这个函数直接把它抛出去，调用方（`_wait_port_free`）连同整轮侦察一起挂掉。
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -318,7 +365,7 @@ def bind_error(host: str, port: int) -> Optional[OSError]:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((host, port))
         return None
-    except OSError as exc:
+    except (OSError, OverflowError, ValueError) as exc:
         return exc
     finally:
         sock.close()

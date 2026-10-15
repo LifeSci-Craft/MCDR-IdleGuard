@@ -1,0 +1,10 @@
+# CI 用的钉死版本：**不写范围**。
+#
+# 范围会随上游漂，出问题时"到底装了什么"没人说得清。真实教训（见 .github/workflows/ci.yml）：
+# MCDR 2.16.0 的 Requires-Python 是 >=3.9，一旦上游把下限抬到 3.10，声明支持 3.9 的那条腿
+# 会在 pip 解析阶段直接失败，看起来却像"插件不支持 3.9"。
+#
+# ⚠️ pytest 9.1.1 自身要求 Python >=3.10，所以 CI 里 Python 3.9 那条腿单独装 pytest==8.3.5，
+# 不使用这个文件（见 ci.yml 的 test 作业）。
+mcdreforged==2.16.0
+pytest==9.1.1
