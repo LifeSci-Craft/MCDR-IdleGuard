@@ -61,6 +61,18 @@ OVERFLOW_READ_TIMEOUT = 1.0
 #: 连接数超限的告警最短间隔（秒）：被扫时不能每来一条连接就写一行日志。
 OVERFLOW_WARN_INTERVAL = 10.0
 
+#: 假服务端**允许客户端发来的**单个数据包长度上限。
+#: 这是一个直接对外、且握手阶段完全没有鉴权的游戏端口：以前它和别处共用协议上限 2 MiB，
+#: 于是任何能连上端口的人都能让我们先准备 2 MiB 的缓冲（按并发上限推算常驻可到 160 MiB）。
+#: 这条路径上真正会出现的包都很小：Handshake 里地址最长 255 字节、LoginStart 里名字 16 字节、
+#: 1.19+ 的签名数据约 1 KiB，Status Request / Ping 是空的或 8 字节。8 KiB 足够宽松。
+MAX_CLIENT_PACKET_LENGTH = 8192
+
+#: 发完登录断开包后等对端关闭的**总**时间预算（秒）：这是整段等待的上限，
+#: 不是每次 recv 的预算 —— 后者会被任何一个字节重置，细水长流的客户端能无限期占住名额。
+#: 顺便还限制累计读取的字节数（正常客户端收到断开包就不说话了）。
+LINGER_MAX_BYTES = 64 * 1024
+
 
 class FakeServer:
     def __init__(
@@ -142,7 +154,11 @@ class FakeServer:
                 # backlog 必须 ≥ 并发上限，否则突发时先撞 backlog：玩家看到的是"连接超时"，
                 # 而不是被我们限流（后者至少有日志、有提示，好排查）
                 sock.listen(max(64, (self._max_connections + self._overflow_slots) * 2))
-            except OSError as exc:
+            except (OSError, OverflowError, ValueError) as exc:
+                # OverflowError：端口超出 0..65535（配置里写错一个数）。它**必须**在这里被接住 ——
+                # 本函数的承诺是"端口不可用时返回 False、不抛异常"（端口还被真实服务端占着是正常情况，
+                # 由上层在轮询里重试）。漏掉它的话：轮询线程在第一个坏条目上中断整轮侦察，
+                # 而抢占端口的后台线程会直接死掉且日志里一句都没有。
                 self._last_error = f'{type(exc).__name__}: {exc}'
                 sock.close()
                 return False
@@ -214,12 +230,29 @@ class FakeServer:
             if slot == 'overflow':
                 self._warn_overflow(peer)
 
-            threading.Thread(
-                target=self._serve_connection,
-                args=(conn, peer, slot == 'overflow'),
-                name=f'IdleGuard-FakeConn-{self._port}',
-                daemon=True,
-            ).start()
+            try:
+                threading.Thread(
+                    target=self._serve_connection,
+                    args=(conn, peer, slot == 'overflow'),
+                    name=f'IdleGuard-FakeConn-{self._port}',
+                    daemon=True,
+                ).start()
+            except Exception as exc:  # noqa: BLE001
+                # ⚠️ 拿到连接、占好名额之后才失败（资源紧张时 Thread.start 抛
+                # RuntimeError: can't start new thread）。两件事都必须做：
+                # ① 把名额还回去 —— 否则它会一直泄漏，攒够上限之后真人玩家的连接
+                #    就再也进不来（连"已休眠，正在启动"的提示都收不到）；
+                # ② **绝不能**让接受线程退出 —— socket 还留在 LISTEN、running 仍是 True，
+                #    但再也没人 accept，玩家连接收不到任何回复、也触发不了唤醒。
+                # 这正是本循环注释声称已防住的失败模式，以前只给 sock.accept 包了 try。
+                self._release(addr[0])
+                self._last_error = f'{type(exc).__name__}: {exc}'
+                self._logger.warning(
+                    f'假服务端接受 {peer} 后启动处理线程失败（{self._last_error}），'
+                    f'已回滚并发名额并继续监听'
+                )
+                self._close_quietly(conn)
+                continue
 
     # ------------------------------------------------------------------ 并发名额
 
@@ -298,7 +331,7 @@ class FakeServer:
                 self._handle_legacy(conn)
                 return
 
-            packet_id, payload = reader.read_packet()
+            packet_id, payload = reader.read_packet(MAX_CLIENT_PACKET_LENGTH)
             if packet_id != 0x00:
                 return
             offset = 0
@@ -319,14 +352,14 @@ class FakeServer:
             self._close_quietly(conn)
 
     def _handle_status(self, conn: socket.socket, reader: ConnReader, protocol: int = -1) -> None:
-        packet_id, _ = reader.read_packet()
+        packet_id, _ = reader.read_packet(MAX_CLIENT_PACKET_LENGTH)
         if packet_id != 0x00:  # Status Request
             return
         status = self._status_factory(protocol)
         conn.sendall(pack_packet(0x00, encode_string(json.dumps(status, ensure_ascii=False))))
         # 可选：回一个 Pong，让客户端的延迟测量正常完成
         try:
-            packet_id, payload = reader.read_packet()
+            packet_id, payload = reader.read_packet(MAX_CLIENT_PACKET_LENGTH)
             if packet_id == 0x01 and len(payload) >= 8:
                 conn.sendall(pack_packet(0x01, payload[:8]))
         except (OSError, ValueError, ConnectionError):
@@ -336,7 +369,7 @@ class FakeServer:
                       short: bool = False) -> None:
         player_name: Optional[str] = None
         try:
-            packet_id, payload = reader.read_packet()
+            packet_id, payload = reader.read_packet(MAX_CLIENT_PACKET_LENGTH)
             if packet_id == 0x00:  # Login Start
                 # 字段顺序为 name [+ 后续字段]，只需读取第一个 String 即可拿到玩家名
                 player_name, _ = parse_string(payload, 0)
@@ -352,12 +385,22 @@ class FakeServer:
             if short:
                 # 溢出名额：发完就走，不等对端关闭（这类连接的存在本身就是压力）
                 return
-            # 等待对端先关闭，避免本机侧产生 TIME_WAIT 残留
-            conn.settimeout(self._linger_timeout)
-            while True:
-                chunk = conn.recv(1024)
+            # 等待对端先关闭，避免本机侧产生 TIME_WAIT 残留。
+            # ⚠️ 必须给整段等待一个**绝对**截止时间：以前 `conn.settimeout(linger_timeout)`
+            # 是"每次 recv"的预算，任何字节都会把它重置 —— 每 0.5 秒发 1 字节的客户端能
+            # 把一条连接无限期占住（实测 12 秒后仍在占名额），攒够并发名额后真人玩家
+            # 就收不到"已休眠，正在启动"这句提示了（而那正是假服务端存在的全部价值）。
+            deadline = time.monotonic() + self._linger_timeout
+            budget = LINGER_MAX_BYTES
+            while budget > 0:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                conn.settimeout(max(0.05, left))
+                chunk = conn.recv(min(1024, budget))
                 if not chunk:
                     break
+                budget -= len(chunk)
         except (OSError, ValueError, ConnectionError):
             pass
 
@@ -376,7 +419,12 @@ class FakeServer:
         )
         data = text.encode('utf-16-be')
         try:
-            conn.sendall(b'\xff' + encode_ushort(len(text)) + data)
+            # 这个长度字段的语义是 **UTF-16 码元数**，不是码点数：非 BMP 字符（emoji 等）
+            # 在 UTF-16 里占 2 个码元，而 len(text) 数的是码点 —— 于是 MOTD 里一个 emoji
+            # 就会让声明值比实际少 1，按声明读取的 1.6 客户端尾部会少一个字符。
+            # 文案可由用户在 config/idle_guard/lang 下覆盖，所以这是用户可触发的。
+            units = len(text.encode('utf-16-le')) // 2
+            conn.sendall(b'\xff' + encode_ushort(min(units, 65535)) + data)
             time.sleep(0.1)
         except (OSError, ValueError):
             pass

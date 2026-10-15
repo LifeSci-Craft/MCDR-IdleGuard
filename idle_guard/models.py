@@ -60,13 +60,39 @@ def _parse_startup_sample(item) -> Optional[StartupSample]:
 #: 合法的 Minecraft 玩家名。名字来自客户端握手（是可以随便造的），
 #: 而这个名字会被拼进 tellraw / playsound 这类命令里执行 —— 必须过滤，
 #: 否则一个叫 `a] ... ` 的假客户端就能往服务端注入命令。
-_PLAYER_NAME_RE = re.compile(r'^[A-Za-z0-9_]{1,16}$')
+#: ⚠️ 用 `\Z` 而不是 `$`：`$` 在 Python 里也匹配"字符串末尾的换行之前"，
+#: 于是 `'Steve\n'` 会被当成合法玩家名（`\Z` 才是真正的末尾）。
+_PLAYER_NAME_RE = re.compile(r'^[A-Za-z0-9_]{1,16}\Z')
 
 
 def safe_player_name(player: Optional[str]) -> str:
     """只放行合法玩家名；不合法一律返回空串（调用方据此跳过）。"""
     name = str(player or '').strip()
     return name if _PLAYER_NAME_RE.match(name) else ''
+
+
+#: 音效 id 的长度上限。原版的音效资源位置最长不到 40 字符，留一点余量就够；
+#: 之所以要有上限：它会和玩家名一起被拼进服务端控制台命令，越长越容易被拿来做文章。
+MAX_SOUND_ID_LENGTH = 64
+
+#: 合法的音效资源位置：命名空间 + 资源名，只允许小写字母、数字、下划线、点、冒号、连字符。
+#: **刻意不 strip()**：带任何空白（含首尾空格）都算非法 —— 空白是命令拼接里最有用的分隔符。
+#: `\Z` 而不是 `$`：`$` 会放行末尾那个换行（那正是注入要用的东西）。
+_SOUND_ID_RE = re.compile(r'^[a-z0-9_.:-]+\Z')
+
+
+def safe_sound_id(sound: Optional[str]) -> str:
+    """只放行合法的音效资源位置；不合法一律返回空串（调用方据此跳过）。
+
+    ⚠️ 与玩家名同一个理由：这个字符串来自配置**也来自总线对端**，而它会被拼成
+    `execute at P run playsound <sound> master P ~ ~ ~ 1 1` 交给服务端控制台执行；
+    MCDR 的 `send()` 是 `(text + "\\n")` 直接写服务端 stdin，所以值里一个换行
+    就等于第二条控制台命令。空白的挡法就一条：白名单字符集 + 长度上限。
+    """
+    text = str(sound or '')
+    if not text or len(text) > MAX_SOUND_ID_LENGTH:
+        return ''
+    return text if _SOUND_ID_RE.match(text) else ''
 
 
 class ManagedServer:
@@ -108,11 +134,19 @@ class ManagedServer:
         #: 服务端重新起来、或插件明确要休眠/唤醒时清掉。
         self.external_stop = False
         self.attempts: Dict[str, float] = {}
+        #: attempts 的锁。它由"假服务端的连接线程"（record_attempt）与"唤醒线程"
+        #: （attempt_players 取名单）同时读写：record_attempt 在迭代 attempts 清理过期项时
+        #: 被另一条连接插入会抛 RuntimeError，而那个异常被 fakeserver._note_login_attempt
+        #: 捕获成一条日志 —— 于是 record_attempt 之后的 wake_server 不再执行：
+        #: 两个玩家同时连接休眠中的服，会静默丢掉一次唤醒。
+        self.attempts_lock = threading.Lock()
         #: 唤醒完成时那位玩家还不在线（他多半已经被假服务端挡回客户端了），
         #: 于是记下"等他进服要补一句『服开好了』"：player -> 到期时刻（monotonic）。
         #: 之所以要这样：唤醒是在**服务端内部**广播的，而他此刻不在这个服务端里，
         #: 单独 tell 也发不出去（玩家不在线）—— 结果就是他什么提示都收不到。
+        #: 写入在唤醒线程、读取在玩家进服事件里，所以同样要一把锁。
         self.pending_greetings: Dict[str, float] = {}
+        self.greetings_lock = threading.Lock()
 
         self.action_lock = threading.RLock()
         self.startup_event = threading.Event()
@@ -139,13 +173,31 @@ class ManagedServer:
 
     def record_attempt(self, player: Optional[str], now: float, window: float) -> None:
         key = player or '?'
-        self.attempts[key] = now
-        for stale in [k for k, ts in self.attempts.items() if now - ts > window]:
-            self.attempts.pop(stale, None)
+        with self.attempts_lock:
+            self.attempts[key] = now
+            # 先 list(...) 取快照再删：直接迭代 dict 时被另一条连接线程插入会抛
+            # RuntimeError（"dictionary changed size during iteration"）
+            for stale in [k for k, ts in list(self.attempts.items()) if now - ts > window]:
+                self.attempts.pop(stale, None)
 
     def attempt_players(self, now: float, window: float) -> List[str]:
-        return [name for name, ts in self.attempts.items()
-                if name != '?' and now - ts <= window]
+        with self.attempts_lock:
+            return [name for name, ts in list(self.attempts.items())
+                    if name != '?' and now - ts <= window]
+
+    def remember_greeting(self, player: str, expiry: float) -> None:
+        """记下"等他进服时补一句『服开好了』"（唤醒线程调用）。"""
+        with self.greetings_lock:
+            self.pending_greetings[player] = expiry
+
+    def pop_greeting(self, player: str) -> Optional[float]:
+        with self.greetings_lock:
+            return self.pending_greetings.pop(player, None)
+
+    def drop_expired_greetings(self, now: float) -> None:
+        with self.greetings_lock:
+            for stale in [name for name, ts in list(self.pending_greetings.items()) if now > ts]:
+                self.pending_greetings.pop(stale, None)
 
 
 @dataclass

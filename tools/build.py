@@ -13,8 +13,9 @@ MCDR 不会碰它们。
 - **白名单**打包：只有明确列出的文件会进包（README 一律不进包）；
 - 包内 `.py` 的 `#` 注释与 docstring **全部清空**（注释只留在仓库里给开发者看），
   清空但**保留空行**，所以安装版抛异常时的行号与仓库文件一致；
-- 文本文件统一成 LF、zip 时间戳固定，于是**同一个源码打两次得到完全一样的字节**
-  （谁都能"按 tag 重新构建、比对 sha256"来验证一个发布）。
+- 包内 CHANGELOG **只留最新一版**（`packaged_changelog()` 真去裁剪并断言只剩一节）；
+- 文本文件统一成 LF、zip 时间戳与 `create_system` 固定，于是**同一个源码在任何操作系统上
+  打两次都得到完全一样的字节**（谁都能"按 tag 重新构建、比对 sha256"来验证一个发布）。
 
 自检：`python tools/check_artifact.py`（另见该文件）。
 """
@@ -40,6 +41,8 @@ PACKAGE_DIR = os.path.join(ROOT, PLUGIN_ID)
 
 #: 进包的包内根文件（白名单）；元数据单独从仓库根取
 ROOT_FILES = ('requirements.txt', 'CHANGELOG.md', 'LICENSE')
+#: 包内 CHANGELOG 的裁剪（只留最新一版）靠这个文件名识别
+CHANGELOG_NAME = 'CHANGELOG.md'
 #: 允许整目录打包的子目录：扩展名白名单
 PACKAGE_DATA_DIRS = {'lang': ('.json',)}
 
@@ -110,6 +113,28 @@ def packaged_bytes(path: str) -> bytes:
     return data
 
 
+def packaged_changelog(path: str) -> bytes:
+    """进包的 CHANGELOG：**只留最新一个版本节**。
+
+    包内只该带一个版本的条目（更早的在 Release 页上）—— 这里才是让它成真的地方。
+    以前 `build_mcdr()` 对 CHANGELOG.md 走的是普通 `packaged_bytes`，而 docstring 与
+    运行结束的打印都声称"只留最新一版"：仓库里的文件恰好被人手删成了一节，所以看不出来，
+    一旦某次发版忘了删，历史条目会全部进包（MCDR-ModUpdateChecker 的 1.6.0 就这样带进过
+    28,363 字节，占产物 29.4%）。两条守卫让它**不可能**静默发生：一节都没有 → 报错退出；
+    裁剪后仍然不是恰好一节 → 报错退出。
+    """
+    text = packaged_bytes(path).decode('utf-8')
+    lines = text.splitlines(keepends=True)
+    headings = [index for index, line in enumerate(lines) if line.startswith('## ')]
+    if not headings:
+        raise SystemExit(f'{os.path.basename(path)} 里没有任何 "## <版本>" 节，无法裁剪')
+    if len(headings) > 1:
+        text = ''.join(lines[:headings[1]])
+    if sum(1 for line in text.splitlines() if line.startswith('## ')) != 1:
+        raise SystemExit(f'{os.path.basename(path)} 裁剪后不是恰好一个版本节')
+    return text.encode('utf-8')
+
+
 # --------------------------------------------------------------------------- #
 # 清单
 # --------------------------------------------------------------------------- #
@@ -150,6 +175,11 @@ def _zip_info(arcname: str) -> zipfile.ZipInfo:
     info = zipfile.ZipInfo(arcname, date_time=FIXED_ZIP_TIMESTAMP)
     info.external_attr = 0o644 << 16
     info.compress_type = zipfile.ZIP_DEFLATED
+    # ⚠️ 这个字段不写的话由打包机自己决定：win32 写 0（FAT），其他平台写 3（unix），
+    # 于是同一棵干净源码在 Windows 与 Linux 上打出**不同字节**（实测 sha256 前缀
+    # c515609a… / 4db0ecb3…，大小一样），而"按 tag 重新构建、比对 sha256"正是本仓库
+    # 与另两个插件仓库一起承诺的验证方式。钉成 3 之后跨操作系统也能逐字节复现。
+    info.create_system = 3              # unix
     return info
 
 
@@ -160,7 +190,12 @@ def build_mcdr(files: list, version: str) -> str:
         for name in files:
             path = source_path(name)
             arcname = name if name == 'mcdreforged.plugin.json' else f'{PLUGIN_ID}/{name}'
-            payload = packaged_python(path) if name.endswith('.py') else packaged_bytes(path)
+            if name.endswith('.py'):
+                payload = packaged_python(path)
+            elif name == CHANGELOG_NAME:
+                payload = packaged_changelog(path)
+            else:
+                payload = packaged_bytes(path)
             zf.writestr(_zip_info(arcname), payload)
     return target
 
@@ -211,7 +246,7 @@ def main() -> int:
     print()
     print(f'已生成打包插件：{os.path.relpath(mcdr_path, ROOT)}  ({os.path.getsize(mcdr_path)} bytes)')
     print('说明：包内 .py 的注释与 docstring 已清空（行号保留），README 不进包，'
-          'CHANGELOG 只留最新一版。')
+          'CHANGELOG 只留最新一版（由 packaged_changelog() 裁剪并断言）。')
     print('安装方式：')
     print(f'  A) 把 {os.path.basename(mcdr_path)} 放进 MCDR 的 plugins/ 目录')
     print(f'  B) 把仓库根目录（含 mcdreforged.plugin.json 与同名包 {PLUGIN_ID}/）'

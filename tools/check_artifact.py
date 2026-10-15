@@ -3,16 +3,21 @@
 
 四件事分开查，因为它们各自会以不同的方式静默出错：
 
-* **可复现**：打包器固定了 zip 时间戳与权限位、并把文本统一成 LF。同一个源码打两次必须
-  字节相同 —— 否则"按 tag 重新构建再比 sha256"这句承诺就是假的。
+* **可复现**：打包器固定了 zip 时间戳、权限位与 **`create_system`**、并把文本统一成 LF。
+  同一个源码打两次必须字节相同，**换操作系统也一样**（不固定 create_system 时 win32 写 0/FAT、
+  其他平台写 3/unix，同一棵源码在两个系统上 sha256 不同）—— 否则"按 tag 重新构建再比 sha256"
+  这句承诺就是假的。
 * **内容**：只允许插件代码 + 元数据 + LICENSE + CHANGELOG 进包。白名单之外的任何东西
   （README、tests/、tools/、__pycache__）都是打包器的 bug。
 * **不漏包**：源码目录 `idle_guard/` 下的每个 `*.py` 与 `lang/*.json` 都必须出现在产物成员里。
   白名单是手工维护的，"新增模块忘了加进白名单"会静默丢包 —— 必须在这里被拦下。
+* **包内 CHANGELOG 只有一节**：`build.packaged_changelog()` 负责裁剪，这里再断一次
+  "恰好一节"且"节标题里的版本号 == 元数据 version"，防的是"裁剪器悄悄失效"。
 * **剥离**：注释与 docstring 属于仓库、不属于产物。这里对包内每个 .py 再跑一遍 tokenize
   与 ast —— 只看体积的话，"剥离器悄悄失效"是发现不了的。
-* **可加载**：包内 mcdreforged.plugin.json 能解析，且 id / author 符合预期、version 与
-  `idle_guard/__init__.py` 里的 `PLUGIN_VERSION` 一致；每个 .py 剥离之后仍然能编译
+* **可加载**：包内 mcdreforged.plugin.json 能解析，且 id / author / version 符合预期、
+  **主页（link）与许可证（license）都非空**、version 与 `idle_guard/__init__.py` 里的
+  `PLUGIN_VERSION` 一致；每个 .py 剥离之后仍然能编译
   （剥离用的是 tokenize + ast，出错就会变成用户那边的语法错误）。
 
 用法::
@@ -149,7 +154,52 @@ def check_contents(path: str, problems: list) -> dict:
     if declared and metadata.get('version') != declared:
         problems.append(f'产物版本 {metadata.get("version")!r} 与 {PLUGIN_ID}/__init__.py 的 '
                         f'PLUGIN_VERSION {declared!r} 不一致（发版时漏改了其中一个？）')
+    # 主页与许可证：2.13–2.15 只认 legacy 的 link，2.16 看 links.homepage（两者写同一个值）。
+    # 两个都空的话，`!!MCDR plugin list` 与插件信息页里既没有仓库链接、license 也是空的。
+    if not (metadata.get('link') or (metadata.get('links') or {}).get('homepage')):
+        problems.append('元数据里没有主页：legacy 的 "link" 与 2.16 的 "links.homepage" 都是空的')
+    if not metadata.get('license'):
+        problems.append('元数据里没有 "license"（仓库里放着 MIT 的 LICENSE 文件）')
     return metadata
+
+
+def check_changelog(path: str, problems: list) -> None:
+    """包内 CHANGELOG 必须只有一节，且那一节的版本号与元数据一致。
+
+    为什么单独查：`build.packaged_changelog()` 是"包内只留最新一版"这条规范的唯一执行点，
+    而它一旦失效是**静默**的 —— 包照常生成、体积悄悄变大、历史条目全进包
+    （MCDR-ModUpdateChecker 的 1.6.0 就这样带进过 28,363 字节）。所以自检要交叉核对。
+    """
+    name = f'{PLUGIN_ID}/{build.CHANGELOG_NAME}'
+    try:
+        text = _read(path, name).decode('utf-8')
+    except KeyError:
+        problems.append(f'产物里没有 {name}')
+        return
+    headings = [line for line in text.splitlines() if line.startswith('## ')]
+    if len(headings) != 1:
+        problems.append(f'包内 {build.CHANGELOG_NAME} 有 {len(headings)} 个版本节'
+                        f'（应当只剩最新一版）：{headings[:5]}')
+        return
+    try:
+        metadata = json.loads(_read(path, 'mcdreforged.plugin.json').decode('utf-8'))
+    except (KeyError, ValueError) as error:
+        problems.append(f'读不出元数据，无法核对 changelog 版本：{error}')
+        return
+    version = str(metadata.get('version') or '')
+    heading = headings[0][3:].strip()
+    if version and version not in heading:
+        problems.append(f'包内 {build.CHANGELOG_NAME} 的最新一节是 {heading!r}，'
+                        f'而元数据 version 是 {version!r} 不匹配')
+
+
+def check_zip_create_system(path: str, problems: list) -> None:
+    """产物里每个成员的 `create_system` 都必须是 3（unix）：不钉死它就不能跨系统复现。"""
+    with zipfile.ZipFile(path) as archive:
+        bad = sorted(info.filename for info in archive.infolist()
+                     if info.create_system != 3)
+    if bad:
+        problems.append(f'这些成员的 create_system 不是 3（跨操作系统打出的字节会不同）：{bad[:5]}')
 
 
 def check_stripped(path: str, problems: list) -> None:
@@ -281,6 +331,8 @@ def main() -> int:
             metadata = check_contents(path, problems)
             check_member_coverage(path, problems)
             check_stripped(path, problems)
+            check_changelog(path, problems)
+            check_zip_create_system(path, problems)
             print(f'  {os.path.basename(path)}  size={os.path.getsize(path)} '
                   f'sha256={sha256(path)[:16]}…  version={metadata.get("version")}')
     else:
@@ -291,6 +343,8 @@ def main() -> int:
             metadata = check_contents(path, problems)
             check_member_coverage(path, problems)
             check_stripped(path, problems)
+            check_changelog(path, problems)
+            check_zip_create_system(path, problems)
             print(f'  {os.path.basename(path)}  size={os.path.getsize(path)} '
                   f'sha256={sha256(path)[:16]}…  version={metadata.get("version")}')
             check_folder_layout(tmp, problems)
@@ -302,8 +356,9 @@ def main() -> int:
         for problem in problems:
             print(f'  ✗ {problem}')
         return 1
-    print('\n全部通过：可复现（逐成员 + 整包）、内容白名单、无漏包、注释与 docstring 已剥离、'
-          '元数据与源码版本一致、代码仍可编译。')
+    print('\n全部通过：可复现（逐成员 + 整包 + 跨系统固定 create_system）、内容白名单、无漏包、'
+          '注释与 docstring 已剥离、包内 CHANGELOG 只剩最新一版且版本一致、'
+          '元数据（id/author/version/主页/license）齐备、代码仍可编译。')
     return 0
 
 

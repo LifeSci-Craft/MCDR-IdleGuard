@@ -76,7 +76,7 @@
 **配置文件按功能分组（只在文件层面）。** `config.py` 里的字段一律平铺（代码与测试直接读属性），
 写进 `config.json` 时由 `CONFIG_LAYOUT` + `Config.serialize()` 归成 `sleep` / `startup` / `announce` /
 `fake_server` / `bus` / `servers` 几段，读回来时 `Config.deserialize()` 先摊平。这么做有两个好处：
-老配置（平铺写法）**照原样能读**（不必写迁移、不会丢值），而且加字段时不用改 309 个测试。
+老配置（平铺写法）**照原样能读**（不必写迁移、不会丢值），而且加字段时不必逐个改测试套件里的用例。
 `announce` 是"真子对象 + 布局组"重叠的那一个（多塞了 `player_attempt_window`），两个方向都要保留
 它自己的字段（`tests/test_config_defaults.py` 有专门的用例盯着）。
 
@@ -95,6 +95,10 @@
   （症状是"某个子服一直只监视"，线上查了两轮）。现在留空按 `auto` 处理，老配置升级即自动具备该行为。
 - `bus.token` 默认曾是一个写死的公开口令 → 跨机器部署等于没有防线。现在首次生成配置时由
   `new_bus_token()` 现生成随机串；`LEGACY_BUS_TOKEN` 只留给自检识别老配置。
+- 仓库里的 `user-config/idle_guard-config.json` 是给用户看的**示例**（插件不读它、代码里零引用）：
+  它的 `bus.token` 故意写成 `CHANGE_ME_…` 占位串 —— 照抄它部署多实例等于没有鉴权。
+  空口令、历史默认值 `idle_guard` 与 `CHANGE_ME` 前缀的占位串都会被 `!!ig check` 点名，
+  而且空口令会让 `Bus.start()` **直接拒绝启动总线**；照抄之前先把口令换成只在自己实例间共享的随机串。
 
 **启动完成判定用多信号。** MCDR 的 `is_server_startup()` 在 Paper 上实测返回 False，
 所以判定 = MCDR 标志 或 状态查询可用 或（进程活着且端口能接受 TCP 连接）。
@@ -240,20 +244,41 @@ python tools/check_artifact.py
 python tools/mcdr_matrix.py
 python tools/mcdr_matrix.py --reuse      # 复用已有实例目录（不做删除动作）
 
-# 端到端场景（需要上一级的 ../test-network/ 那套真实群组服已启动）
+# 端到端场景（**需要仓库外**的 ../test-network/ 那套真实群组服已启动）
 python ../test-network/start_all.py --wait 180
 python ../test-network/scenario_idle_guard.py   # 报告：../test-network/logs/e2e_report.md
 python ../test-network/stop_all.py
 ```
 
+### 跨版本 / 端到端验证的前置条件（别以为 clone 下来就能跑）
+
+这两项都**依赖本机或仓库外的环境**，不在 CI 里假装覆盖，所以"跑不起来"通常是环境缺失：
+
+- `tools/mcdr_matrix.py` 需要本机预装好 `2.13.0 / 2.14.1 / 2.15.0 / 2.15.7 / 2.16.0`
+  五套解释器（脚本按目录名去找），并且需要一套**低于最低版本**的环境（本机约定是 `mcdr212`，
+  即 MCDR 2.12.0）来做"低于最低版本应被依赖检查干净拒绝"那一项 —— 缺了它这一项会判失败，
+  那是**工具设计的如实结果**，不是插件缺陷。在 `review-batch3/scratch/` 下自建 venv
+  再 `pip install mcdreforged==2.12.0` 即可补齐。
+- 端到端场景需要仓库外的 `../test-network/`（Velocity + 2×Paper 1.21.4 + 2 个 MCDR 实例 +
+  mineflayer 假玩家），本仓库**不含**这套工具，报告也写在那边
+  （`../test-network/logs/e2e_report.md`）。第 243-246 行的命令只有在那个目录存在时才有意义。
+
 打包白名单：包根只放 `mcdreforged.plugin.json` / `requirements.txt` / `CHANGELOG.md` / `LICENSE` 与
 `*.py`，`lang/` 只收 `.json`。README 与开发文档不进包（体积大、对运行无用）。
+
+包内 `CHANGELOG.md` 会被 `packaged_changelog()` **真裁到只剩最新一版**（一节都没有或裁完不是一节
+就直接报错退出），zip 里的 `create_system` 也钉成 3（unix）—— 不钉的话同一棵源码在 Windows 与
+Linux 上 sha256 不同，"按 tag 重新构建、比对 sha256"这句承诺跨系统就不成立。`tools/check_artifact.py`
+对这两条都有断言（包内 changelog 节数 + 版本号交叉核对、每个成员的 `create_system`）。
+
+守卫本身也有人盯：`python tools/mutation_check.py` 把 9 条关键守卫逐个改坏，要求对应测试必须失败
+（某条"活下来"就说明盯它的用例是装饰品）。它跑在一棵临时副本上，绝不碰工作树。
 
 ## 已验证 / 未验证
 
 已实测：
 
-- 单元 / 集成测试 **360 项全部通过**（`python -m pytest tests/`）：协议编解码、SLP 查询、假服务端
+- 单元 / 集成测试**全部通过**（`python -m pytest tests/`，具体数量见最新一版 CHANGELOG 的验证节）：协议编解码、SLP 查询、假服务端
   应答与登录打断、总线鉴权与收发（含两个真实例互发指令）、命令层（控制台来源、异步不阻塞、
   reload 的两条提示）、界面标准（顶栏与底线同宽、底线提示居中、帮助页两列对齐、浮窗每行不超过
   32 列、开关列可点）、多语言（选语言 / 同语族兜底 / 缺键退回英文 / 用户覆盖文件 / 两份语言文件
@@ -273,16 +298,15 @@ python ../test-network/stop_all.py
 - 打包产物自检：同一源码打两次字节完全相同、内容白名单、注释与 docstring 已剥离且剥离后仍可编译、
   两种安装布局都正确。
 - **测试网络真机**（Velocity 3.5.1 + 2 台 Paper 1.21.4 + 2 个 MCDR 实例）：
-  - 端到端场景 **38/41**（`../test-network/logs/e2e_report.md`）：空闲休眠、假服务端接管端口、跨服通知、
-    连接触发唤醒、单独提醒玩家、二次休眠；
-  - ⚠️ 剩下 3 项与代码缺陷无关，但需要决定怎么处理：
-    ①「休眠预告送达玩家」对应的是 **v1.1.0 已删除的 `announce.warn_before_sleep`**
-    （休眠前 15 秒的预告），场景断言过时 —— 要么更新场景，要么恢复该功能；
-    ② 远端子服的 `sleep` 现在由**负责它的实例**判断（本实例不再用心跳缓存抢先回绝，
-    否则会把该执行的操作挡掉），所以「对休眠中的服再 sleep」会先给确认提示、
-    确认后才由负责方回"不用再休眠了"；本实例自己负责的子服行为不变；
-    ③「对运行中的服 wake」那条抓到的是假玩家被史莱姆击杀的死亡消息（日志取样撞车），
-    属场景噪声，重跑通常就会过；
+  - 当前结论以 `idle_guard/CHANGELOG.md` 的"验证"节为准（**最新一次：端到端 40/40 全部通过**）：
+    空闲休眠、假服务端接管端口、跨服通知、连接触发唤醒、单独提醒玩家、二次休眠。
+  - 📌 **历史记录（已过时，只在追溯时看）**：v1.1.x 时期的一份报告是 38/41，三个失败与代码缺陷无关：
+    ①「休眠预告送达玩家」对应的是 **v1.1.0 已删除的 `announce.warn_before_sleep`**（场景断言过时）；
+    ② 远端子服的 `sleep` 改由**负责它的实例**判断后，「对休眠中的服再 sleep」会先给确认提示、
+    确认后才由负责方回"不用再休眠了"（本实例自己负责的子服行为不变）；
+    ③「对运行中的服 wake」那条抓到的是假玩家被史莱姆击杀的死亡消息（日志取样撞车），属场景噪声。
+    这三条后来都在场景侧处理掉了，所以**不要再拿 38/41 当当前结论** —— 两份文档给出互斥结论
+    本身就是这次审查指出来的问题。
   - 顶栏与底线宽度精确相等（实测都是 58 列）；跨实例动作由负责方执行并回结果（实测秒级）；
   - 玩家对着休眠中的子服输入 `/server` 收到的原文是
     `服务器 survival 已休眠，正在自动启动…预计 25 秒后可用，请稍后再用 /server survival 进入`，

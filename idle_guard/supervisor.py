@@ -33,13 +33,16 @@ from mcdreforged.api.types import PluginServerInterface
 from . import i18n
 from . import velocity as velocity_module
 from .bus import Bus, parse_address
-from .config import FAKE_SERVER_BIND, LEGACY_BUS_TOKEN, Config, ServerEntry, default_servers
+from .config import (
+    BUS_TOKEN_PLACEHOLDER_PREFIX, FAKE_SERVER_BIND, LEGACY_BUS_TOKEN, VALID_ROLES, Config,
+    ServerEntry, default_servers, sanitize_numbers,
+)
 from .mcproto import PingResult, bind_error, port_open, status_ping
 from .remote import RemoteMixin
 from .takeover import TakeoverMixin
 from .models import (
-    MANAGED_ROLES, STALE_PLAYER_SECONDS, ManagedServer, PendingAction, ServerView,
-    StartupSample, State, _parse_startup_sample, safe_player_name,
+    MANAGED_ROLES, MAX_SOUND_ID_LENGTH, STALE_PLAYER_SECONDS, ManagedServer, PendingAction,
+    ServerView, StartupSample, State, _parse_startup_sample, safe_player_name, safe_sound_id,
 )
 from .stats import Stats
 
@@ -58,6 +61,41 @@ _STARTUP_SAMPLES_MAX = 8
 #: 表现成"插件已经卸下了，端口上却还挂着假服务端"。所以这里给足时间；
 #: 真超时的那些由 `_ensure_fake_server` 入口处的 `_stopping` 守卫收手。
 _POLL_JOIN_TIMEOUT = 20.0
+
+#: 状态探测线程池的 worker 数（只跑 status_ping，超时 3 秒）
+_PING_POOL_WORKERS = 8
+#: 对端实例探测线程池的 worker 数。
+#: ⚠️ 与状态探测**分池**是刻意的：两者以前共用一个 8 worker 的池，而对端探测是可被
+#: 总线消息反复提交的长任务（每个对端 1.5 秒），于是"对端多且慢"会把池占满，
+#: 让状态探测的 as_completed 到点抛 TimeoutError、整轮侦察被丢掉（见 `_ping_all` 的注释）。
+_PEER_POOL_WORKERS = 4
+
+#: 单次 status_ping 的超时（秒），也是下面预算公式里的"每个目标最坏多久"
+_PING_PER_TARGET = 3.0
+
+#: 轮询循环里 `Event.wait()` 的硬上限（秒）：数值校验之外的兜底夹取
+_MAX_POLL_WAIT = 3600.0
+
+#: 端口接管的后台重试退避序列（秒）与总时长上限（秒）。
+#: 见 `_takeover_retry_loop`：没有上限时，端口被"不响应协议探测"的东西占着就会永远重试。
+_TAKEOVER_RETRY_STEPS = (0.25, 0.5, 1.0, 2.0, 5.0)
+_TAKEOVER_RETRY_MAX_SECONDS = 300.0
+
+
+def _ping_budget(count: int, workers: int = _PING_POOL_WORKERS,
+                 per_target: float = _PING_PER_TARGET) -> float:
+    """一轮状态查询的 `as_completed` 预算（秒）。
+
+    以前这里写死 15 秒，等于假设"目标数 ≤ worker 数 × 5"：目标一多（或者池被别的任务占着），
+    预算到点就抛 TimeoutError，把整轮侦察的副作用（状态刷新、假服务端维护、空闲判定）全部丢掉。
+    现在按"目标数 / worker 数"估批次数：每批最坏 `per_target` 秒，再多给 5 秒余量；
+    下限仍是 15 秒（目标少时保持原来的宽松度）。预算只决定"记不记一条 warning"，
+    已收到的结果一律保留（见 `_ping_all`）。
+    """
+    if count <= 0:
+        return 0.0
+    batches = -(-count // max(1, workers))
+    return max(15.0, batches * per_target + 5.0)
 
 
 def _median(values: List[float]) -> float:
@@ -138,7 +176,15 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         #: 新建一个：默认 state_tick=5 秒，等于每天上万次线程创建/销毁，每个探测连接还会
         #: 留下一批 TIME_WAIT。只在轮询线程里提交任务，shutdown 时统一关掉。
         self._pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=8, thread_name_prefix='IdleGuard-Ping')
+            max_workers=_PING_POOL_WORKERS, thread_name_prefix='IdleGuard-Ping')
+        #: 对端实例探测单独一把池：它由总线消息（对端状态变化）反复提交，且每个对端要等
+        #: 1.5 秒，和状态探测挤在一起会把上面那把池占满（详见 _PEER_POOL_WORKERS 的注释）。
+        self._peer_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_PEER_POOL_WORKERS, thread_name_prefix='IdleGuard-Peer')
+        #: 对端探测的 in-flight 去重：总线补刷只做 1 秒去抖，挡不住"上一批还没跑完又来一批"，
+        #: 于是同一个对端地址会被排队探测很多次、把探测池与对端都压住。
+        self._peer_poll_lock = threading.Lock()
+        self._peer_poll_running = False
 
         self._managed: Dict[str, ManagedServer] = {}
         self._views: Dict[str, ServerView] = {}      # 所有子服（含只监视的）最新快照
@@ -158,8 +204,14 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         self._self_name: Optional[str] = None
         #: 为什么认定"本实例负责这台服"（给 !!ig diag 展示，省得管理员猜）
         self._claim_reason: str = ''
-        #: 最近的状态变化（`!!ig diag` 的"最近事件"），只留最后若干条
+        #: 最近的状态变化（`!!ig diag` 的"最近事件"），只留最后若干条。
+        #: 它被任意线程 append（`_set_state`）、在命令线程里迭代（`recent_events`），
+        #: 而 deque 的迭代器一旦被并发修改会直接抛 "deque mutated during iteration" ——
+        #: 那样 `!!ig diag` 整页都出不来。所以两边共用这把锁。
         self._recent: Deque[Tuple[float, str]] = deque(maxlen=12)
+        self._recent_lock = threading.Lock()
+        #: 启动耗时样本落盘用的锁（每个 _do_wake 线程都会写同一个文件）
+        self._startup_lock = threading.RLock()
         self.instance_name = ''
         #: 发起人 -> 待二次确认的动作（每个管理员各存一份，避免互相顶掉）
         self._pending: Dict[str, PendingAction] = {}
@@ -169,7 +221,15 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         self._startup_seconds: Dict[str, List[StartupSample]] = self._load_startup_seconds()
         #: 休眠 / 唤醒的累计计数（落盘），`!!ig stats` 用
         self._stats = Stats(os.path.join(self._data_dir, 'stats.json')
-                            if self._data_dir else None)
+                            if self._data_dir else None,
+                            logger=self._logger)
+
+        # 数值配置的范围校验放在最前面：一个 `check_interval: 0` 或 `1e400`（= inf）会让
+        # 轮询线程忙转 / 直接死掉，后面的角色判定、总线解析全都没机会发挥作用。
+        self._number_problems: List[Tuple[str, object, object]] = []
+        self._sanitize_numbers()
+        #: 非法 role 的条目（已归一化成 auto），供 `!!ig check` 点名
+        self._invalid_roles: List[Tuple[str, object]] = []
 
         self._ignore_patterns: List[re.Pattern] = []
         for pattern in config.ignore_players:
@@ -273,6 +333,19 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         """
         return token_fingerprint(self._config.bus.token)
 
+    def _sanitize_numbers(self) -> None:
+        """把越界 / 非有限的数值配置改回默认值（原因见 `config.NUMERIC_LIMITS`）。
+
+        只做"改回默认值 + 记一次 warning + 进自检"，不改用别的插值策略：这些值语义各不相同
+        （有的是秒、有的是次数），把 inf 夹到 86400 与直接退回默认值相比，后者更容易解释。
+        """
+        for name, value, default in sanitize_numbers(self._config):
+            self._number_problems.append((name, value, default))
+            self._logger.warning(
+                f'配置项 {name} 的值 {value!r} 不在允许范围内'
+                f'（必须是范围内的有限数）—— 本次按默认值 {default!r} 运行'
+            )
+
     def config_warnings(self) -> List[str]:
         """配置自检：返回一串「能一眼看懂、能直接照做」的问题说明（没问题就是空列表）。
 
@@ -293,7 +366,18 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         elif state == 'invalid':
             out.append(tr('check.bus.invalid', value=detail or '?'))
 
-        # ② 两条填了同一个总线地址：它们会互相抢端口
+        # ② 口令：空口令下总线**等于没有鉴权**（Bus.start 会拒绝启动），历史默认值与示例占位串
+        #    同理。跨机器部署时口令是唯一的防线，而留空是很容易发生的（删值、只留引号）。
+        token = str(self._config.bus.token or '')
+        stripped_token = token.strip()
+        if not stripped_token:
+            out.append(tr('check.bus.empty_token'))
+        elif stripped_token == LEGACY_BUS_TOKEN:
+            out.append(tr('check.bus.default_token'))
+        elif stripped_token.upper().startswith(BUS_TOKEN_PLACEHOLDER_PREFIX):
+            out.append(tr('check.bus.placeholder_token', value=stripped_token))
+
+        # ③ 两条填了同一个总线地址：它们会互相抢端口
         seen: Dict[str, str] = {}
         for entry in self._config.servers:
             if not entry.bus:
@@ -305,7 +389,7 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             else:
                 seen[entry.bus] = entry.name
 
-        # ③ 两条子服用了同一个名字：`_managed` 以名字为键，后一条会**静默覆盖**前一条，
+        # ④ 两条子服用了同一个名字：`_managed` 以名字为键，后一条会**静默覆盖**前一条，
         #    而状态表按配置顺序渲染会列出两行同名（管理员以为配了两台，实际只有一台受管）
         counted: Dict[str, int] = {}
         for entry in self._config.servers:
@@ -315,7 +399,7 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             if count > 1:
                 out.append(tr('check.server.duplicated_name', server=name, count=count))
 
-        # ④ 配了自动休眠、却不会有任何一个实例去关它
+        # ⑤ 配了自动休眠、却不会有任何一个实例去关它
         for entry in self._config.servers:
             managed = self._managed.get(entry.name)
             role = managed.role if managed is not None else entry.role
@@ -328,9 +412,22 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                 # role=auto 期望"端口与它一致的那台 MCDR"来管，可没人知道去哪找它
                 out.append(tr('check.unowned.no_bus', server=entry.name))
 
-        # ⑤ 口令还是历史默认值（新生成的配置已经是随机串，所以这条只对老配置有意义）
-        if (self._config.bus.token or '') == LEGACY_BUS_TOKEN:
-            out.append(tr('check.bus.default_token'))
+        # ⑥ 每条子服的地址与端口：越界端口不是"探测失败"，而是连 socket 都不接受 ——
+        #    它会以 OverflowError 的形式在 bind / connect 处炸出来，打断整轮侦察。
+        for entry in self._config.servers:
+            if not str(entry.host or '').strip():
+                out.append(tr('check.server.host', server=entry.name or '?'))
+            port = entry.port
+            if not (isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535):
+                out.append(tr('check.server.port', server=entry.name or '?', port=port))
+
+        # ⑦ 越界的数值配置：已经改回默认值运行了，但用户得知道"你写的那个没生效"
+        for name, value, default in self._number_problems:
+            out.append(tr('check.value.out_of_range', name=name, value=value, default=default))
+
+        # ⑧ 非法的 role：已按 auto 处理，同时点出来（否则 diag 里会打出原始键名）
+        for server, role in self._invalid_roles:
+            out.append(tr('check.role.invalid', server=server, role=role))
 
         return out
 
@@ -362,10 +459,16 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         return {address: dict(health) for address, health in self._peer_health.items()}
 
     def recent_events(self) -> List[str]:
-        """最近的状态变化（带时间戳），最新的在后。"""
+        """最近的状态变化（带时间戳），最新的在后。
+
+        与 `_set_state` 共用 `_recent_lock`：deque 的迭代器一旦被并发 append 就会抛
+        "deque mutated during iteration"，那样 `!!ig diag` 整页都出不来。
+        """
         now = time.monotonic()
         out = []
-        for stamp, text in self._recent:
+        with self._recent_lock:
+            events = list(self._recent)
+        for stamp, text in events:
             clock = time.strftime('%H:%M:%S', time.localtime(time.time() - (now - stamp)))
             out.append(f'{clock}  {text}')
         return out
@@ -426,6 +529,7 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         self._poll_thread = None
         # 常驻探测池：不再接收新任务，也不等已在跑的那几个（它们最长 3 秒就自己结束）
         self._pool.shutdown(wait=False)
+        self._peer_pool.shutdown(wait=False)
         for managed in self._managed.values():
             if managed.fake is not None:
                 managed.fake.stop()
@@ -494,7 +598,7 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             self._velocity_status = {'state': 'disabled'}
             return
         try:
-            path, found = velocity_module.load_servers(setting, os.getcwd())
+            path, found, skipped = velocity_module.load_servers_detailed(setting, os.getcwd())
         except Exception as exc:  # noqa: BLE001
             self._velocity_status = {'state': 'error', 'error': f'{type(exc).__name__}: {exc}'}
             self._logger.warning(f'读取 Velocity 配置出错（跳过同步）：{type(exc).__name__}: {exc}')
@@ -509,10 +613,17 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                 self._logger.warning(f'velocity.path 填的 {setting!r} 不是一个存在的文件，跳过子服同步')
             return
         if not found:
-            self._velocity_status = {'state': 'empty', 'path': path}
+            self._velocity_status = {'state': 'empty', 'path': path, 'skipped': len(skipped)}
             self._logger.info(f'读到了 {path}，但里面没有可用的 [servers] 条目，跳过同步')
             return
-        self._velocity_status = {'state': 'ok', 'path': path, 'count': len(found)}
+        self._velocity_status = {'state': 'ok', 'path': path, 'count': len(found),
+                                 'skipped': len(skipped)}
+        if skipped:
+            # 被丢掉的行必须能看见：以前它们一声不响地消失，管理员只能自己数 velocity.toml
+            self._logger.debug(f'{path} 的 [servers] 段里有 {len(skipped)} 行没被采用：'
+                               + ' | '.join(skipped[:10]))
+            self._logger.info(f'{path} 的 [servers] 段里有 {len(skipped)} 行读不懂已跳过'
+                              f'（开启 debug 可看原文；!!ig check 也会带上这个计数）')
 
         template = {entry.name: entry for entry in default_servers()}
         source = os.path.basename(path)
@@ -649,9 +760,14 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             )
 
         for entry in entries:
-            role = entry.role if entry.role in ('self', 'command', 'watch') else 'auto'
-            if entry.role not in ('auto', 'self', 'command', 'watch'):
+            # 非法取值在这里就**归一化**成 auto（而不是只记一句 warning 把原值放过去）：
+            # 原值留在条目上会让两块屏给出不同结论 —— status 的白名单降级显示"只监视"，
+            # 而 diag 会把原始键名 `role.nonsense` 直接打出来（i18n 缺键就退回键名本身）。
+            if entry.role not in VALID_ROLES:
                 self._logger.warning(f'服务器 {entry.name} 的 role={entry.role!r} 非法，按 auto 处理')
+                self._invalid_roles.append((entry.name, entry.role))
+                entry.role = 'auto'
+            role = entry.role if entry.role in ('self', 'command', 'watch') else 'auto'
             if role == 'auto':
                 role = 'self' if entry.name == self_name else 'watch'
             if role in MANAGED_ROLES:
@@ -755,7 +871,17 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         tick = self._config.state_tick
         # ≤0 = 关掉心跳（退回"只有侦察周期才更新状态"）；正数则至少 0.2 秒，别把 CPU 烧了
         interval = max(0.2, tick) if tick > 0 else self._config.check_interval
+        # 兜底夹取：数值校验（_sanitize_numbers）已经挡掉了 0 / inf / nan，这里再夹一道 —
+        # 万一以后有别的路径改配置，也不会让 Event.wait() 拿到一个离谱的值。
+        interval = min(max(interval, 0.1), _MAX_POLL_WAIT)
+        # 对端探测自己的节拍：**不能**挂在"心跳"上。tick ≤ 0 时下面 `full` 恒为真，
+        # `_tick_states` 一次都不会跑，于是对端快照 / 健康度再没有更新来源 ——
+        # 状态表里别人负责的服永远退回本地旧快照，跨实例等待状态也只能白等到超时。
+        # 心跳关掉时取一个折中值（≥5 秒、≤60 秒：读路径的缓存 TTL 上界就是 60 秒）。
+        peer_interval = (max(0.2, tick) if tick > 0
+                         else min(60.0, max(5.0, self._config.check_interval)))
         next_full = 0.0                      # 立刻先做一次完整侦察
+        next_peer = 0.0
         while not self._stopping.is_set():
             full = time.monotonic() >= next_full
             try:
@@ -763,6 +889,9 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                     self.poll_once()
                 else:
                     self._tick_states()
+                if time.monotonic() >= next_peer:
+                    self._submit_peer_poll()
+                    next_peer = time.monotonic() + peer_interval
             except Exception as exc:  # noqa: BLE001 - 轮询线程必须活着
                 self._logger.error(f'轮询时出现异常：{type(exc).__name__}: {exc}', exc_info=True)
                 if full:
@@ -773,8 +902,17 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             else:
                 if full:
                     next_full = time.monotonic() + self._config.check_interval
-            if self._stopping.wait(interval):
-                return
+            try:
+                if self._stopping.wait(interval):
+                    return
+            except (OverflowError, ValueError) as exc:
+                # `Event.wait()` 对 inf / nan / 极大的值抛 OverflowError。这条以前在 try 之外，
+                # 于是轮询线程**静默死亡**：自动休眠、唤醒、假服务端维护全部停止，
+                # 而 MCDR 日志里没有任何记录（数值校验已经挡住了配置来源，这里是最后一道）。
+                self._logger.error(f'轮询间隔 {interval!r} 不可用（{type(exc).__name__}: {exc}），'
+                                   f'改用 60 秒继续；请检查 check_interval / state_tick')
+                if self._stopping.wait(60.0):
+                    return
 
     def _tick_states(self) -> None:
         """状态心跳：把每一行子服的状态都刷到秒级。
@@ -817,8 +955,10 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             self._views[entry.name] = self._build_view(entry, ping)
         for managed_server in managed:
             self._ensure_fake_server(managed_server, retry=True)
-        # 顺便探一下对端实例：状态表要能区分"没人管"与"管它的实例掉线了"
-        self._poll_peers()
+        # 对端探测**不在这里**做：它的节拍归 `_poll_loop`（每 state_tick 秒；心跳被关掉时
+        # 也照样跑）。挂在这里就会漏掉 `state_tick ≤ 0` 那种配置 —— 那时轮询循环里
+        # `full` 恒为真，`_tick_states` 一次都不会执行（IG-A-07）。
+        self._reconcile_sleep_stats()
 
     def poll_once(self) -> None:
         """侦察一轮：更新所有子服状态、维护假服务端、判定空闲。"""
@@ -833,6 +973,16 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             self._ensure_fake_server(managed, retry=True)
         for managed in self._managed.values():
             self._check_idle(managed)
+        self._reconcile_sleep_stats()
+
+    def _reconcile_sleep_stats(self) -> None:
+        """按"当前确实在休眠"的集合校正统计里的休眠起点（见 `Stats.reconcile`）。
+
+        插件重载会重建 Stats：正在睡的那台服在内存里没有起点，于是"已休眠时长"从重载那一刻
+        起一直是 0，整段都不算。这里在每轮侦察 / 心跳后补一个起点。
+        """
+        self._stats.reconcile(managed.name for managed in self._managed.values()
+                              if managed.state == State.SLEEPING)
 
     def _ping_all(self) -> Dict[str, PingResult]:
         entries = [e for e in self._config.servers if e.name]
@@ -840,15 +990,31 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         if not entries:
             return results
         futures = {
-            self._pool.submit(status_ping, e.host, e.port, 3.0): e
+            self._pool.submit(status_ping, e.host, e.port, _PING_PER_TARGET): e
             for e in entries
         }
-        for future in concurrent.futures.as_completed(futures, timeout=15.0):
-            entry = futures[future]
-            try:
-                results[entry.name] = future.result()
-            except Exception as exc:  # noqa: BLE001
-                results[entry.name] = PingResult(online=False, error=f'{type(exc).__name__}: {exc}')
+        budget = _ping_budget(len(futures))
+        pending = set(futures)
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=budget):
+                pending.discard(future)
+                entry = futures[future]
+                try:
+                    results[entry.name] = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    results[entry.name] = PingResult(online=False, error=f'{type(exc).__name__}: {exc}')
+        except concurrent.futures.TimeoutError:
+            # ⚠️ 这里以前会让 TimeoutError 直接冒出去，后果是**整轮侦察的副作用全丢**：
+            # 状态刷新、假服务端维护、空闲判定一个都没跑，_poll_loop 记一条 ERROR 并把下一轮
+            # 推后一整个 check_interval（默认 10 分钟）—— 自动休眠对全部子服停摆 10 分钟。
+            # 现在：已经收到的结果照常保留（下面照旧逐台处理），没完成的按"这一轮没有数据"
+            # 降级，并记一条能看出是哪几台的 warning。
+            unfinished = sorted(futures[future].name for future in pending)
+            self._logger.warning(
+                f'状态查询未在 {int(budget)} 秒内全部完成（{len(pending)}/{len(futures)} 个未返回：'
+                f'{", ".join(unfinished)}）—— 这些子服本轮按"没有数据"处理，其余照常刷新。'
+                f'若反复出现，检查是否有大量子服不可达或本机线程池被占满'
+            )
         return results
 
     def _build_view(self, entry: ServerEntry, ping: Optional[PingResult]) -> ServerView:
@@ -931,6 +1097,7 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                     new_state = State.SLEEPING
                 else:
                     new_state = State.OFFLINE
+            self._settle_if_running(managed, new_state)
             self._set_state(managed, new_state)
         else:
             if managed.slp.online and not managed.slp.is_fake:
@@ -942,6 +1109,10 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                 new_state = State.SLEEPING
             else:
                 new_state = State.OFFLINE
+            # role=command 的子服由状态查询转 RUNNING，不经过 _do_wake —— 这正是
+            # "外部唤醒不结算休眠时长"与"永不写 last_stopped_at"的另一半（见两个 helper）
+            self._settle_if_running(managed, new_state)
+            self._note_external_stop(managed, new_state)
             self._set_state(managed, new_state)
 
         if self._config.debug:
@@ -953,6 +1124,37 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                 f'[侦察] {managed.name}: state={managed.state.value} players={players} '
                 f'idle={idle} locked={managed.locked} ({note})'
             )
+
+    def _settle_if_running(self, managed: ManagedServer, new_state: State) -> None:
+        """状态即将变成 RUNNING，而它此前不是在跑：结算上一段休眠。
+
+        入口必须覆盖**所有**"服务端确实起来了"的路径，而不是只有 `_do_wake`：
+        - 管理员从 MCDR 控制台 / 脚本直接开服（`on_server_startup`）；
+        - `role=command` 的子服由状态查询转 RUNNING。
+        这两条都不经过 `note_wake`，而 `note_wake` 是唯一会 pop `_sleeping_since` 的地方 ——
+        少了结算，`!!ig stats` 的"已休眠时长"会从那一刻起一直涨（每小时多算 3600 秒）。
+        `settle()` 只结算时长、不加唤醒计数，且对同一台服重复调用是幂等的。
+        """
+        if new_state != State.RUNNING or managed.state == State.RUNNING:
+            return
+        seconds = self._stats.settle(managed.name)
+        if seconds:
+            self._logger.info(f'{managed.name}: 已恢复运行（非插件唤醒），本次休眠 {int(seconds)} 秒')
+        # 它又跑起来了：上一段"停机"到此为止（下次唤醒时才算得出停机时长）
+        managed.last_stopped_at = None
+
+    def _note_external_stop(self, managed: ManagedServer, new_state: State) -> None:
+        """由在线转离线时补一次 `last_stopped_at`（覆盖"外部停服"）。
+
+        `last_stopped_at` 原先只在 `on_server_stop` 里写，而那个函数被 `role == 'self'`
+        收在分支内；`role=command` 的子服只能等本实例发停止命令，没人记账 —— 于是
+        `_down_seconds()` 恒为 None、样本的 gap 恒为 None，冷 / 热启动分桶对它们永久失效
+        （纯 role=command 正是本插件主推的部署形态之一）。
+        """
+        if managed.state != State.RUNNING or new_state == State.RUNNING:
+            return
+        if managed.last_stopped_at is None:
+            managed.last_stopped_at = time.monotonic()
 
     def _is_ready(self, managed: ManagedServer, ping: Optional[PingResult]) -> bool:
         """服务端是否已经可供玩家连接。
@@ -1012,11 +1214,29 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         if old != state:
             self._logger.info(f'{managed.name}: {old.value} -> {state.value}'
                               + (f'（{detail}）' if detail else ''))
-            self._recent.append(
-                (time.monotonic(),
-                 f'{managed.name}: {old.value} -> {state.value}' + (f'（{detail}）' if detail else '')))
+            with self._recent_lock:
+                self._recent.append(
+                    (time.monotonic(),
+                     f'{managed.name}: {old.value} -> {state.value}'
+                     + (f'（{detail}）' if detail else '')))
             if state != State.RUNNING:
                 managed.empty_since = None
+            # 告诉对端"我这台子服的状态变了"。它与玩家可见的通知是**两条通道**：
+            # 以前这件事靠 `_announce(...)` 的文案顺带做，于是 `announce.enabled = false`
+            # 时连总线广播都不发，对端的快照与健康度再没有更新来源（配合 state_tick ≤ 0
+            # 就是彻底不更新）。
+            self._broadcast_peer_state_change()
+
+    def _broadcast_peer_state_change(self) -> None:
+        """只通知对端"状态变了"（不走本地喊话，也不受 announce.enabled 影响）。"""
+        addresses = self._peer_addresses()
+        if not addresses:
+            return
+        try:
+            self._bus.broadcast_async(addresses, {'type': 'announce', 'kind': 'state',
+                                                  'instance': self.instance_name})
+        except Exception as exc:  # noqa: BLE001 - 通知失败不能影响状态机
+            self._logger.debug(f'广播状态变化失败：{type(exc).__name__}: {exc}')
 
     # ================================================================== 空闲判定
 
@@ -1094,13 +1314,15 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         if managed.started_at is not None and now - managed.started_at < self._config.min_uptime:
             return
 
-        self._logger.info(f'{managed.name}: 连续 {int(idle)} 秒无人，执行自动休眠（{note}）')
-        ok, detail = self.sleep_server(managed.name, reason='idle')
-        if not ok:
-            # 例如刚好有人进来了（_can_sleep 会拒绝）：把空闲计时清零重新数，
-            # 否则每一轮侦察都会再试一次、把日志刷满
-            managed.empty_since = None
-            self._logger.info(f'{managed.name}: 本次自动休眠没有执行（{detail}），空闲计时重新开始')
+        self._logger.info(f'{managed.name}: 连续 {int(idle)} 秒无人，转入后台自动休眠（{note}）')
+        # ⚠️ 不在轮询线程里同步跑 sleep_server：它要等到服务端停稳（`stop_timeout` 默认 180 秒），
+        # 而它是 poll_once / _tick_states 的一部分 —— 那期间本实例的状态心跳、假服务端维护、
+        # 其它子服的空闲判定全部停摆（实测 stop_timeout=3.0 就阻塞 3.05 秒；默认配置下是 3 分钟）。
+        # 命令层与远程动作早就把这两件事丢后台了，只有自动休眠这条路径还是同步的。
+        self._sleep_in_background(managed.name, reason='idle', by='system')
+        # 立刻清掉空闲计时：动作线程会把它推进 STOPPING，而 _check_idle 只在 RUNNING 时计时 ——
+        # 不清的话，动作失败后下一轮会拿着同一个 empty_since 再判一次（日志会被刷满）。
+        managed.empty_since = None
 
     # ================================================================== 休眠
 
@@ -1281,6 +1503,12 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                 self._set_state(managed, State.RUNNING, self.tr('detail.wait_stop_timeout'))
                 return False, self.tr('action.sleep_timeout', server=name)
 
+            if managed.role != 'self':
+                # role=command 的子服不经过 on_server_stop（那是 MCDR 事件，只有 role=self 才有），
+                # 所以"停机时刻"必须在这里记：少了它，_down_seconds 恒为 None、样本的 gap 恒为
+                # None，冷 / 热启动分桶对它们永久失效（纯 role=command 是本插件主推形态之一）。
+                managed.last_stopped_at = time.monotonic()
+
             # 端口彻底释放后交给假服务端接管（等太久就转后台线程，见 _take_over_port）
             self._take_over_port(managed, timeout=min(5.0, self._config.port_release_timeout))
             if managed.fake is not None and managed.fake.running:
@@ -1298,16 +1526,41 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             return True, self.tr('action.sleep_stopped', server=name)
 
     def _takeover_retry_loop(self, managed: ManagedServer) -> None:
+        """后台持续抢端口，直到接管、被唤醒、或者**到点放弃**。
+
+        为什么要有"到点放弃"与退避：循环条件只有 `_stopping` 与"状态变成 STARTING/RUNNING"。
+        当端口被一个**不响应 Minecraft 状态查询**的东西占着（`enable-status=false` 的真实服务端、
+        卡死的残留监听、别的服务）时，"可以强接管"成立而 bind 又未必成功，于是永不放弃：
+        实测 5 秒内 20 次判定（每次都含最长 1 秒的协议探测），而只有第一次有 warning，
+        之后没有任何"我放弃了"的可诊断信号。
+        """
+        started = time.monotonic()
+        attempt = 0
         while not self._stopping.is_set():
             if managed.state in (State.STARTING, State.RUNNING):
                 return          # 有人把它唤醒了，端口要留给真实服务端
-            force = self._can_force_take_over(managed)
+            # 协议探测（最长 1 秒）降频：每 3 轮才做一次，其余轮次只重试 bind
+            force = self._can_force_take_over(managed) if attempt % 3 == 0 else False
             self._ensure_fake_server(managed, force=force)
             if managed.fake is not None and managed.fake.running:
                 self._logger.info(f'{managed.name}: 假服务端已接管 {managed.entry.port}，'
                                   f'玩家连接现在能触发自动唤醒')
                 return
-            self._stopping.wait(0.25)
+            elapsed = time.monotonic() - started
+            if elapsed >= _TAKEOVER_RETRY_MAX_SECONDS:
+                reason = managed.fake.last_error if managed.fake else '端口一直被占用'
+                self._logger.warning(
+                    f'{managed.name}: 已连续 {int(elapsed)} 秒没能把端口 {managed.entry.port} '
+                    f'交给假服务端（{reason}）—— 放弃后台重试。这期间玩家连接会被拒绝；'
+                    f'请检查端口上到底是谁在监听（netstat / lsof），或下次唤醒后再试'
+                )
+                if managed.state == State.OFFLINE:
+                    managed.detail = self.tr('detail.takeover_give_up',
+                                             port=managed.entry.port, seconds=int(elapsed))
+                return
+            attempt += 1
+            delay = _TAKEOVER_RETRY_STEPS[min(attempt - 1, len(_TAKEOVER_RETRY_STEPS) - 1)]
+            self._stopping.wait(delay)
 
     def _wait_stopped(self, managed: ManagedServer, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -1379,6 +1632,26 @@ class Supervisor(TakeoverMixin, RemoteMixin):
 
     def _do_wake(self, managed: ManagedServer, reason: str, by: str,
                  trigger_player: Optional[str]) -> None:
+        """唤醒线程体（`wake_server` 用它起线程）。
+
+        ⚠️ 这里必须兜住**所有**异常：未捕获的线程异常只会走 `threading.excepthook`，
+        MCDR 日志里一句都没有；而此刻状态已经被置成 STARTING、假服务端也已经撤下 ——
+        表现是"这台服永远显示启动中、`!!ig sleep` 被正在启动中拒绝、自动休眠对它失效"，
+        管理员完全无从下手（线上就是这么踩的）。所以：记 error + 走 `_wake_failed`
+        把状态机和假服务端放回可用状态。
+        """
+        try:
+            self._do_wake_inner(managed, reason, by, trigger_player)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.error(
+                f'{managed.name} 唤醒过程中出现未预期异常：{type(exc).__name__}: {exc}',
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                self._wake_failed(managed, detail=f'{type(exc).__name__}: {exc}')
+
+    def _do_wake_inner(self, managed: ManagedServer, reason: str, by: str,
+                       trigger_player: Optional[str]) -> None:
         name = managed.name
         with managed.action_lock, self._action(managed):
             if self._stopping.is_set():
@@ -1453,7 +1726,7 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                     else:
                         # 他还不在任何服务端里（被挡回客户端了）：此刻 tell 发不出去，
                         # 先记下来，等他真正进服时再补（见 on_player_joined）
-                        managed.pending_greetings[player] = now + window
+                        managed.remember_greeting(player, now + window)
 
     def _wait_port_free(self, managed: ManagedServer, timeout: float) -> bool:
         """等端口上的监听者退干净，好让真实服务端能绑上。
@@ -1513,6 +1786,9 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         self._announce(self.tr('announce.failed', server=managed.name, detail=detail))
         if managed.wake_failures >= self._config.max_wake_failures:
             managed.locked = True
+            # 状态说明里点明"已锁定"（这条文案以前是零引用的死键）：状态表/浮窗上
+            # 只看到"未运行"时，管理员不知道还要先 !!ig unlock
+            managed.detail = self.tr('detail.locked_after_failures')
             self._announce(self.tr('announce.locked', server=managed.name, count=managed.wake_failures))
             self._logger.error(f'{managed.name} 连续 {managed.wake_failures} 次启动失败，已锁定自动唤醒')
 
@@ -1539,7 +1815,12 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         except FileNotFoundError:
             return {}
         except Exception as exc:  # noqa: BLE001
-            self._logger.warning(f'启动耗时记录读取失败（忽略）：{type(exc).__name__}: {exc}')
+            # 坏文件先隔离再返回空表：以前只记一条 debug 就返回 {}，下一次写入会把
+            # "也许还能人工抢救"的内容覆盖掉，而且不留痕迹说明它坏过（Stats 早就是这么做的）。
+            # 这个文件里是每台服的启动耗时样本 —— 丢了等于 ETA 退回兜底值。
+            self._logger.warning(f'启动耗时记录读取失败（已隔离为 .corrupt，本次从零开始）：'
+                                 f'{type(exc).__name__}: {exc}')
+            self._quarantine_file(path)
             return {}
         result: Dict[str, List[StartupSample]] = {}
         if isinstance(data, dict):
@@ -1556,18 +1837,33 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                     result[name] = samples[-_STARTUP_SAMPLES_MAX:]
         return result
 
+    @staticmethod
+    def _quarantine_file(path: str) -> None:
+        """把读不动的数据文件改名留证（`xxx.json.corrupt`），绝不阻断插件运行。"""
+        try:
+            os.replace(path, f'{path}.corrupt')
+        except OSError:
+            pass
+
     def _remember_startup_seconds(self, name: str, seconds: float,
                                   down_seconds: Optional[float] = None) -> None:
         """记下这次实测的启动耗时（内存 + 落盘），ETA 用这些样本的中位数。
 
         `down_seconds` = 距上次停止过了多久，用来把样本分成冷 / 热启动两桶。
+        落盘与 `Stats.save()` 同一套做法：**锁内浅拷贝 + 写 .tmp + os.replace**。
+        以前是 `open(path, 'w') + json.dump`，而写者来自每个 `_do_wake` 线程 ——
+        两个子服同时唤醒就会互相截断（实测 40 轮并发写里 7 轮产出 `json.load` 读不动的文件），
+        读端又只记一条 debug 就返回 {}，于是**全部**子服的启动耗时样本清零。
         """
         seconds = max(0.5, round(float(seconds), 1))
         if down_seconds is not None:
             down_seconds = max(0.0, round(float(down_seconds), 1))
-        samples = self._startup_seconds.setdefault(name, [])
-        samples.append((seconds, down_seconds))
-        del samples[:-_STARTUP_SAMPLES_MAX]
+        with self._startup_lock:
+            samples = self._startup_seconds.setdefault(name, [])
+            samples.append((seconds, down_seconds))
+            del samples[:-_STARTUP_SAMPLES_MAX]
+            payload = {server: [list(sample) for sample in values]
+                       for server, values in self._startup_seconds.items()}
         managed = self._managed.get(name)
         if managed is not None:
             managed.last_startup_seconds = seconds
@@ -1585,10 +1881,15 @@ class Supervisor(TakeoverMixin, RemoteMixin):
             return
         path = os.path.join(self._data_dir, _STARTUP_STATS_FILE)
         try:
-            with open(path, 'w', encoding='utf-8') as handle:
-                json.dump(self._startup_seconds, handle, ensure_ascii=False, indent=2)
+            tmp_path = f'{path}.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
         except Exception as exc:  # noqa: BLE001
-            self._logger.debug(f'启动耗时记录写入失败：{type(exc).__name__}: {exc}')
+            # 提到 warning：写不进去意味着"下次给玩家的 ETA 会退回兜底值"，
+            # 以前这条是 debug，管理员在默认日志级别下永远看不到
+            self._logger.warning(f'启动耗时记录写入失败（本次样本只在内存里）：'
+                                 f'{type(exc).__name__}: {exc}')
 
     def _eta(self, managed: Optional[ManagedServer]) -> float:
         """预计启动耗时：取最近若干次实测的**中位数**。
@@ -1649,7 +1950,9 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         if not self._config.announce.enabled or not text:
             return
         self._say_local(text)
-        self._bus.broadcast_async(self._peer_addresses(), {'type': 'announce', 'kind': 'say', 'text': text})
+        self._bus.broadcast_async(self._peer_addresses(), {
+            'type': 'announce', 'kind': 'say', 'text': text, 'instance': self.instance_name,
+        })
 
     def tell_player(self, player: str, text: str) -> None:
         if not text:
@@ -1657,6 +1960,7 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         self._tell_local(player, text)
         self._bus.broadcast_async(self._peer_addresses(), {
             'type': 'announce', 'kind': 'tell', 'player': player, 'text': text,
+            'instance': self.instance_name,
         })
 
     def play_sound(self, player: str, sound: str) -> None:
@@ -1665,23 +1969,42 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         用来提醒"你刚才想进的服已经开好了" —— 玩家很可能已经切到别的界面，
         光有聊天栏文字容易被漏掉。
         """
-        if not sound or not safe_player_name(player):
+        if not sound:
+            return
+        # 音效 id 来自配置（也会经总线到达对端），而它会被拼进服务端控制台命令：
+        # 这里挡不合法值，`_play_local` 那道是纵深防御（远程路径也走它）。
+        if not safe_sound_id(sound):
+            self._logger.warning(
+                f'拒绝播放音效：{sound!r} 不是合法的音效 id'
+                f'（只允许 [a-z0-9_.:-]，长度不超过 {MAX_SOUND_ID_LENGTH}）'
+            )
             return
         self._play_local(player, sound)
         self._bus.broadcast_async(self._peer_addresses(), {
             'type': 'announce', 'kind': 'sound', 'player': player, 'sound': sound,
+            'instance': self.instance_name,
         })
 
     def _play_local(self, player: str, sound: str) -> None:
-        if not self._has_player(player):
+        # 纵深防御：调用方可能漏了校验（`_on_bus_message` 那条路径尤其危险 ——
+        # player 与 sound 都是对端给的字符串）。这里再挡一道，非法就丢弃并记 warning。
+        safe_player = safe_player_name(player)
+        safe_sound = safe_sound_id(sound)
+        if not safe_player or not safe_sound:
+            self._logger.warning(
+                f'拒绝播放音效（玩家名或音效 id 不合法）：player={player!r} sound={sound!r}'
+            )
+            return
+        if not self._has_player(safe_player):
             return
         # 在他自己的位置放，否则控制台执行时声源在世界原点，距离一远就听不见了
-        command = f'execute at {player} run playsound {sound} master {player} ~ ~ ~ 1 1'
+        command = (f'execute at {safe_player} run playsound {safe_sound} '
+                   f'master {safe_player} ~ ~ ~ 1 1')
         try:
             self._mcdr.execute(command)
-            self._logger.debug(f'已向 {player} 播放音效 {sound}')
+            self._logger.debug(f'已向 {safe_player} 播放音效 {safe_sound}')
         except Exception as exc:  # noqa: BLE001 - 放音效失败不能影响别的事
-            self._logger.debug(f'给 {player} 放音效失败：{type(exc).__name__}: {exc}')
+            self._logger.debug(f'给 {safe_player} 放音效失败：{type(exc).__name__}: {exc}')
 
     def _say_local(self, text: str) -> None:
         self._logger.info(f'[通知] {text}'.replace('§', '&'))
@@ -1805,10 +2128,10 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                     live.add(view.name)
                     if instance:
                         self._owner_name[view.name] = instance
-                        # 只有"刚刚真的通过话"才算心跳：缓存里的旧快照不刷新对端健康度，
-                        # 否则一个刚挂掉的实例会被它 5 秒前的数据"续命"（健康度由心跳自己维护）
-                        if snapshot.get('fresh_probe'):
-                            self._mark_peer_alive(instance)
+                        # 注意：这里**不**刷新对端健康度。缓存里的快照最多可以是
+                        # `_snapshot_ttl()` 秒前拍的（默认 15~60 秒），拿它当"刚通过话"会
+                        # 给一个已经挂掉的实例续命。真正的"刚通过话"信号是入站总线消息
+                        # （remote._mark_sender_alive）与 `_poll_peers` 的成功分支。
                 elif target is None:
                     merged[view.name] = view
                 elif not target.instance and view.instance:
@@ -1863,13 +2186,21 @@ class Supervisor(TakeoverMixin, RemoteMixin):
 
         1 秒内最多补一次：广播可能连着来（启动中 → 已开启），别把对端问爆。
         提交到探测线程池执行，所以既不阻塞总线连接线程，也不阻塞任何命令。
+        是否已有同类任务在跑由 `_poll_peers` 自己按 in-flight 去重（去抖挡不住这个）。
         """
         now = time.monotonic()
         if now - self._last_peer_refresh < 1.0:
             return
         self._last_peer_refresh = now
+        self._submit_peer_poll()
+
+    def _submit_peer_poll(self) -> None:
+        """把一次对端探测丢进对端探测池（不在调用者线程里等）。
+
+        去重放在 `_poll_peers` 里做，所以这里重复提交是安全的：已有一批在跑时后面的直接返回。
+        """
         try:
-            self._pool.submit(self._poll_peers)
+            self._peer_pool.submit(self._poll_peers)
         except RuntimeError as exc:      # 线程池已经关了（插件正在卸载）
             self._logger.debug(f'补刷对端状态时线程池已关闭：{exc}')
 
@@ -1881,27 +2212,59 @@ class Supervisor(TakeoverMixin, RemoteMixin):
 
         另外顺手把应答里的**对端快照**缓存下来：读命令（`!!ig status` 等）要用的就是它，
         以前它们会在命令线程上再问一遍（每个对端最多同步等 2 秒）。
+
+        三条约束，都是踩过坑之后加的：
+        - **并行广播**（`Bus.broadcast_map`）：以前逐个 `send()`，成本是 1.5 秒 × 对端数，
+          4 个黑洞对端就是 6 秒；这既是心跳变慢的原因，也是把探测池占满的原因；
+        - **in-flight 去重**：补刷只做 1 秒去抖，同一批任务会被反复提交，池会被排队占满；
+        - 探测与状态查询**分池**（见 `_PEER_POOL_WORKERS`）。
         """
-        for address in self._peer_addresses():
-            entry = self._peer_health.setdefault(address, {})
-            reply = self._bus.send(address, {'type': 'state'}, timeout=1.5)
-            if reply and reply.get('ok'):
-                entry.update(
-                    ok=True, at=time.monotonic(), error='',
-                    instance=str(reply.get('instance') or entry.get('instance', '')),
-                )
-                self._remember_peer_snapshot(address, reply)
-            else:
-                read_error = getattr(self._bus, 'last_error', None)
-                reason = read_error(address) if callable(read_error) else ''
-                entry.update(ok=False, at=time.monotonic(), error=reason or '对端没有应答')
-                # 记一个"刚问过、但它不在线"的标记（servers 为空）：这样读命令知道
-                # "这个地址没有可用数据"，不必再同步去问一次 —— 它会退回本地旧快照，
-                # 并把那些行标成**不可信**（与以前"对端没应答"时的行为一致）。
-                self._peer_snapshots[address] = {
-                    'at': time.monotonic(), 'instance': str(entry.get('instance') or ''),
-                    'servers': [], 'fresh_probe': False,
-                }
+        if not self._begin_peer_poll():
+            self._logger.debug('已有一次对端探测在进行，跳过本次')
+            return
+        try:
+            addresses = self._peer_addresses()
+            if not addresses:
+                return
+            # 带上自己的实例名：对端收到这次**活的**请求后会把它记成"刚通过话"
+            # （见 remote._on_bus_message 里的 _mark_peer_alive）
+            replies = self._bus.broadcast_map(
+                addresses, {'type': 'state', 'instance': self.instance_name}, timeout=1.5)
+            now = time.monotonic()
+            for address in addresses:
+                entry = self._peer_health.setdefault(address, {})
+                reply = replies.get(address)
+                if reply and reply.get('ok'):
+                    entry.update(
+                        ok=True, at=now, error='',
+                        instance=str(reply.get('instance') or entry.get('instance', '')),
+                    )
+                    self._remember_peer_snapshot(address, reply)
+                else:
+                    read_error = getattr(self._bus, 'last_error', None)
+                    reason = read_error(address) if callable(read_error) else ''
+                    entry.update(ok=False, at=now, error=reason or '对端没有应答')
+                    # 记一个"刚问过、但它不在线"的标记（servers 为空）：这样读命令知道
+                    # "这个地址没有可用数据"，不必再同步去问一次 —— 它会退回本地旧快照，
+                    # 并把那些行标成**不可信**（与以前"对端没应答"时的行为一致）。
+                    self._peer_snapshots[address] = {
+                        'at': now, 'instance': str(entry.get('instance') or ''),
+                        'servers': [], 'fresh_probe': False,
+                    }
+        finally:
+            self._finish_peer_poll()
+
+    def _begin_peer_poll(self) -> bool:
+        """尝试占住"对端探测"这一个名额；已有人占着则返回 False。"""
+        with self._peer_poll_lock:
+            if self._peer_poll_running:
+                return False
+            self._peer_poll_running = True
+            return True
+
+    def _finish_peer_poll(self) -> None:
+        with self._peer_poll_lock:
+            self._peer_poll_running = False
 
     # ------------------------------------------------------------------ 对端快照
     @staticmethod
@@ -1982,6 +2345,9 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                 self._logger.info(f'{managed.name}: MCDR 报告启动完成，状态直接置为运行中')
                 managed.started_at = time.monotonic()
                 managed.empty_since = None
+                # 管理员从控制台 / 脚本开服也走这里：它就是"服务端确实起来了"，
+                # 所以这一段休眠要在这里结算（否则 !!ig stats 的已休眠时长会一直涨）
+                self._settle_if_running(managed, State.RUNNING)
                 self._set_state(managed, State.RUNNING, '')
 
     def on_server_stop(self, return_code: int) -> None:
@@ -2062,11 +2428,10 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         假服务端挡回客户端，既不在这个服务端里、也不在任何服务端里，两条消息他都收不到
         （线上反馈："启动好后并没有给我任何提示"）。
         """
-        expiry = managed.pending_greetings.pop(player, None)
+        expiry = managed.pop_greeting(player)
         if expiry is None:
             return
-        for stale in [name for name, ts in managed.pending_greetings.items() if now > ts]:
-            managed.pending_greetings.pop(stale, None)
+        managed.drop_expired_greetings(now)
         if now > expiry:
             return      # 太久之后才进来，就不补了（免得莫名其妙弹一句）
         self.tell_player(player, self.tr(

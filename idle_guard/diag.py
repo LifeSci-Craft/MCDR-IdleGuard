@@ -95,14 +95,23 @@ def _velocity_rows(sup: Supervisor) -> List[Row]:
     info = sup.velocity_status()
     state = str(info.get('state') or 'unknown')
     if state == 'ok':
-        return [(tr('check.velocity.ok', path=info.get('path'), count=info.get('count')),
+        rows = [(tr('check.velocity.ok', path=info.get('path'), count=info.get('count')),
                  RColor.gray)]
+        skipped = int(info.get('skipped') or 0)
+        if skipped:
+            # 有行被丢掉时必须说出来：否则"少了一台子服"只能靠人工数 velocity.toml
+            rows.append((tr('check.velocity.skipped', count=skipped), RColor.yellow))
+        return rows
     if state == 'disabled':
         return [(tr('check.velocity.disabled'), RColor.gray)]
     if state == 'missing_path':
         return [(tr('check.velocity.missing_path', path=info.get('path')), RColor.yellow)]
     if state == 'empty':
-        return [(tr('check.velocity.empty', path=info.get('path')), RColor.yellow)]
+        rows = [(tr('check.velocity.empty', path=info.get('path')), RColor.yellow)]
+        skipped = int(info.get('skipped') or 0)
+        if skipped:
+            rows.append((tr('check.velocity.skipped', count=skipped), RColor.yellow))
+        return rows
     if state == 'not_found':
         return [(tr('check.velocity.not_found', paths=', '.join(info.get('candidates') or [])),
                  RColor.yellow)]

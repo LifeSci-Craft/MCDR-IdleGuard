@@ -72,6 +72,9 @@ _ROLE_COLOURS = {
 }
 
 #: (帮助行的键, 能不能裸跑)
+#: ⚠️ 必须覆盖**命令树上的每一个叶子命令**：以前这里漏了 `unlock` 与 `cancel`，
+#: 于是被锁定的子服（连续启动失败后自动锁定）在帮助页里查不到怎么解锁 ——
+#: `lock` 那一行的文案虽然提了一句 unlock，却既不可点、也没说参数该怎么填。
 _HELP_ROWS = (
     ('status', True),
     ('diag', True),
@@ -80,7 +83,9 @@ _HELP_ROWS = (
     ('wake', False),
     ('sleep', False),
     ('confirm', True),
+    ('cancel', True),
     ('lock', False),
+    ('unlock', False),
     ('poll', True),
     ('reload', True),
 )

@@ -39,6 +39,10 @@ MAX_CONNECTIONS = 64
 #: 单个来源 IP 的连接数上限：防止一台机器把上面的总闸门全占掉。
 MAX_CONNECTIONS_PER_IP = 16
 
+#: listen() 的 backlog。以前写死 16，而上面的连接上限是 64：突发时先撞 backlog 的连接
+#: 会被内核丢掉，表现成"对端莫名其妙连不上"，而不是我们的限流日志。取上限的两倍即可。
+LISTEN_BACKLOG = max(64, MAX_CONNECTIONS * 2)
+
 
 def parse_address(address: str) -> Optional[tuple]:
     """把 "127.0.0.1:25600" 解析为 (host, port)，非法则返回 None。"""
@@ -108,6 +112,18 @@ class Bus:
         if not self._bind_address:
             self._logger.info('未配置总线地址（bus.bind），本实例不接收跨服消息')
             return False
+        # ⚠️ 空口令 = 没有鉴权：`hmac.compare_digest('', '')` 恒为真，于是任何能连上端口的人
+        # 发一个 `token: ""` 的 hello 就能通过校验，接着就能远程休眠 / 唤醒 / 锁定我们的子服。
+        # 配置里留空是很容易发生的（删掉值、只留引号），所以这里直接**拒绝监听**：
+        # 总线不启动只影响跨实例协作，而带着空口令启动等于把远程控制权交出去。
+        # （纯本地使用不受影响：轮询、休眠、唤醒、假服务端都不依赖总线。）
+        if not str(self._token or '').strip():
+            self._logger.error(
+                '总线口令（bus.token）为空或全是空白 —— 已拒绝启动总线：'
+                '空口令下任何客户端都能通过鉴权，等于把休眠 / 唤醒 / 锁定的远程控制权交出去。'
+                '请给所有实例填同一个随机口令（配置里的提示见 !!ig check）'
+            )
+            return False
         parsed = parse_address(self._bind_address)
         if parsed is None:
             self._logger.error(f'总线地址格式非法：{self._bind_address!r}，应为 "host:port"')
@@ -125,7 +141,7 @@ class Bus:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 sock.bind((host, port))
-                sock.listen(16)
+                sock.listen(LISTEN_BACKLOG)
             except (OSError, OverflowError, ValueError) as exc:
                 # OverflowError 由"端口超出 0..65535"触发（正常配置校验会先拦住，这里是兜底：
                 # 异常绝不允许穿透到 on_load，否则整个插件都加载不起来）
@@ -216,17 +232,30 @@ class Bus:
 
     def broadcast(self, addresses: Iterable[str], message: dict, timeout: Optional[float] = None) -> List[dict]:
         """并行地向多个地址广播，返回所有成功的应答。"""
+        return [reply for reply in self.broadcast_map(addresses, message, timeout=timeout).values()
+                if reply is not None]
+
+    def broadcast_map(self, addresses: Iterable[str], message: dict,
+                      timeout: Optional[float] = None) -> Dict[str, Optional[dict]]:
+        """并行地向多个地址广播，返回 {地址: 应答或 None}。
+
+        与 ``broadcast()`` 的区别只在返回值：那个丢掉了"这条应答是谁给的"，而健康度、
+        对端快照这类调用方必须知道哪一条通、哪一条不通。以前它们只能自己一个个 ``send()``——
+        串行 1.5 秒 × 对端数，几个黑洞对端就能把调用它的心跳拖到十几秒（见 supervisor._poll_peers）。
+
+        ``timeout`` 是**每条**连接的往返预算（与 ``send`` 一致），线程并发跑，所以整次调用的
+        墙钟时间约为 ``timeout`` 而不是 ``timeout × 地址数``。
+        """
         targets = [addr for addr in dict.fromkeys(addresses) if parse_address(addr)]
+        results: Dict[str, Optional[dict]] = {}
         if not targets:
-            return []
-        results: List[dict] = []
+            return results
         lock = threading.Lock()
 
         def worker(addr: str) -> None:
             reply = self.send(addr, message, timeout=timeout)
-            if reply is not None:
-                with lock:
-                    results.append(reply)
+            with lock:
+                results[addr] = reply
 
         threads = [threading.Thread(target=worker, args=(addr,), daemon=True) for addr in targets]
         for thread in threads:
@@ -292,12 +321,25 @@ class Bus:
                 self._log_overflow(peer)
                 self._close_quietly(conn)
                 continue
-            threading.Thread(
-                target=self._handle_conn,
-                args=(conn, peer),
-                name='IdleGuard-BusConn',
-                daemon=True,
-            ).start()
+            try:
+                threading.Thread(
+                    target=self._handle_conn,
+                    args=(conn, peer),
+                    name='IdleGuard-BusConn',
+                    daemon=True,
+                ).start()
+            except Exception as exc:  # noqa: BLE001
+                # ⚠️ 拿到连接、占好名额之后才失败（资源紧张时 Thread.start 抛
+                # RuntimeError: can't start new thread）。两件事都必须做：
+                # ① 名额回滚 —— 否则它会一直泄漏，攒够上限后对端实例再也连不进来；
+                # ② **绝不能**让接受线程退出 —— socket 还留在 LISTEN，对端连得上、
+                #    数据发得出去，但永远等不到应答（在对方看来就是"那个实例不在线"）。
+                # 这正是下面注释声称已防住的失败模式，以前只给 sock.accept 包了 try。
+                self._release(addr[0])
+                self._logger.warning(f'总线接受 {peer} 后启动处理线程失败'
+                                     f'（{type(exc).__name__}: {exc}），已回滚名额并继续监听')
+                self._close_quietly(conn)
+                continue
 
     # ------------------------------------------------------------------ 连接治理
 

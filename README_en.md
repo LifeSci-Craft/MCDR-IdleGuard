@@ -76,6 +76,11 @@ its default.
 | `instance_name` | `"auto"` | Name of this instance, used in logs and on the bus. `auto` = the name of the server it owns |
 | `language` | `"auto"` | UI language. `auto` = follow MCDR, or set `zh_cn` / `en_us` |
 | `debug` | `false` | Print per-scan details to the console |
+
+The option names below are **the full paths as they appear in the config file**
+(e.g. `sleep.idle_timeout`) - copy them verbatim. The `servers[]` table lists fields
+inside an entry.
+
 ### `velocity`
 
 | Option | Default | Description |
@@ -105,34 +110,34 @@ does not match it.
 
 | Option | Default | Description |
 |---|---|---|
-| `idle_timeout` | `3600` | Sleep after this many seconds without players |
-| `min_uptime` | `300` | Startup grace period in seconds: no idle check right after the server became ready |
-| `check_interval` | `600` | Scan interval in seconds |
-| `state_tick` | `5` | State heartbeat in seconds, used to refresh the displayed state quickly; `0` = off |
-| `wake_cooldown` | `15` | Minimum seconds between two player-triggered wakes |
-| `confirm_timeout` | `30` | Validity of `!!ig confirm` in seconds |
-| `busy_patterns` | backup regexes | Automatic sleeping is suspended while the server output matches; `[]` = off |
-| `busy_hold_seconds` | `300` | Seconds to stay suspended after one match |
-| `ignore_players` | `[]` | Player names ignored when counting (regex), e.g. bots |
+| `sleep.idle_timeout` | `3600` | Sleep after this many seconds without players |
+| `sleep.min_uptime` | `300` | Startup grace period in seconds: no idle check right after the server became ready |
+| `sleep.check_interval` | `600` | Scan interval in seconds |
+| `sleep.state_tick` | `5` | State heartbeat in seconds, used to refresh the displayed state quickly. **Positive values are clamped to 0.2s minimum** (0.1 really runs at 0.2); `0` or negative = off |
+| `sleep.wake_cooldown` | `15` | Minimum seconds between two player-triggered wakes |
+| `sleep.confirm_timeout` | `30` | Validity of `!!ig confirm` in seconds. **5 seconds minimum** (2 really gives you 5) |
+| `sleep.busy_patterns` | backup regexes | Automatic sleeping is suspended while the server output matches; `[]` = off |
+| `sleep.busy_hold_seconds` | `300` | Seconds to stay suspended after one match |
+| `sleep.ignore_players` | `[]` | Player names ignored when counting (regex), e.g. bots |
 
 ### `startup`
 
 | Option | Default | Description |
 |---|---|---|
-| `startup_timeout` / `stop_timeout` | `300` / `180` | Seconds to wait for the server to be ready / to stop |
-| `port_release_timeout` | `60` | Seconds to wait for the port to become bindable |
-| `fallback_startup_seconds` | `60` | Estimate told to players while no measurement exists (seconds) |
-| `hot_startup_window` | `300` | Hot-start window in seconds: a wake within this time after a stop counts as hot |
-| `max_wake_failures` | `3` | Failed starts in a row before automatic waking is locked |
+| `startup.startup_timeout` / `startup.stop_timeout` | `300` / `180` | Seconds to wait for the server to be ready / to stop |
+| `startup.port_release_timeout` | `60` | Budget in seconds for waiting on the port to be released: the auto-sleep path really uses `min(value, 30)`, the manual `!!ig sleep` path `min(value, 5)`. Timing out is **not** giving up - it switches to background retries (every 0.25s, abandoned after 5 minutes with a warning), and players are still refused while that lasts. Values above 30 therefore change nothing |
+| `startup.fallback_startup_seconds` | `60` | Estimate told to players while no measurement exists (seconds) |
+| `startup.hot_startup_window` | `300` | Hot-start window in seconds: a wake within this time after a stop counts as hot |
+| `startup.max_wake_failures` | `3` | Failed starts in a row before automatic waking is locked |
 
 ### `announce`
 
 | Option | Default | Description |
 |---|---|---|
-| `enabled` | `true` | Whether to broadcast "asleep" and "started" |
-| `tell_attempt_players` | `true` | Whether to notify the player who was turned away |
-| `sound` | `minecraft:block.note_block.pling` | Sound played with that notice; empty string = none |
-| `player_attempt_window` | `600` | Seconds to remember who was turned away |
+| `announce.enabled` | `true` | Whether to broadcast "asleep" and "started" |
+| `announce.tell_attempt_players` | `true` | Whether to notify the player who was turned away |
+| `announce.sound` | `minecraft:block.note_block.pling` | Sound played with that notice; empty string = none |
+| `announce.player_attempt_window` | `600` | Seconds to remember who was turned away |
 
 ### `fake_server` / `bus`
 

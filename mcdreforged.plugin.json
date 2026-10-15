@@ -9,6 +9,13 @@
   "author": [
     "Pau1am"
   ],
+  "link": "https://github.com/LifeSci-Craft/MCDR-IdleGuard",
+  "links": {
+    "homepage": "https://github.com/LifeSci-Craft/MCDR-IdleGuard",
+    "source": "https://github.com/LifeSci-Craft/MCDR-IdleGuard",
+    "issues": "https://github.com/LifeSci-Craft/MCDR-IdleGuard/issues"
+  },
+  "license": "MIT",
   "dependencies": {
     "mcdreforged": ">=2.13.0"
   }

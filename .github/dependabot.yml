@@ -1,0 +1,12 @@
+# workflow 里每个 action 都钉到了 commit SHA —— 这正是"上游把标签指到别的代码上"无法改变
+# CI 跑什么的原因；但也意味着不盯着看就永远不知道有升级。Dependabot 认识 SHA 旁边的
+# `# vX.Y.Z` 注释，会同时改 SHA 与注释，于是升级变成可评审的 PR，而不是一次静默的标签移动。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"

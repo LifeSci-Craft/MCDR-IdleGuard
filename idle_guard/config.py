@@ -70,6 +70,10 @@ FAKE_SERVER_BIND = '0.0.0.0'
 #: 现在新生成的配置会自动填入随机串（见 new_bus_token），保留这个常量只为让自检能提醒老配置改掉。
 LEGACY_BUS_TOKEN = 'idle_guard'
 
+#: 示例配置里用的占位口令前缀（仓库里的 `user-config/idle_guard-config.json` 就是它）。
+#: 照抄示例的多实例部署等于没有鉴权 —— 自检要能把它点名。
+BUS_TOKEN_PLACEHOLDER_PREFIX = 'CHANGE_ME'
+
 
 def new_bus_token() -> str:
     """生成一个新的总线口令（首次生成配置文件时自动填入）。
@@ -231,6 +235,73 @@ class Config(Serializable):
 
 #: role 的合法取值
 VALID_ROLES = ('auto', 'self', 'command', 'watch')
+
+
+# --------------------------------------------------------------------------- #
+# 数值字段的范围
+# --------------------------------------------------------------------------- #
+
+#: 数值配置项的合法范围：(最小, 最大, 默认值)。超范围的值会被**改回默认值**并记一条 warning。
+#:
+#: 为什么必须有这层：这些值全都会被直接喂给 `Event.wait()` / `time.sleep()` / 超时比较，
+#: 而 `Config.deserialize` 对它们不做任何校验。实测过的两种后果都很隐蔽：
+#: - `state_tick=0` + `check_interval=0`：1 秒内跑 135 万次 `poll_once`（每轮都要查所有子服），
+#:   把 CPU 烧满；
+#: - `check_interval=1e400`（= inf）：`Event.wait(inf)` 抛 **OverflowError**，
+#:   轮询线程直接死掉 —— 自动休眠、唤醒、假服务端维护全部停止，而 MCDR 日志里一句都没有。
+#:
+#: 上界统一取一天（86400），"超大"与 inf / nan 一样按非法处理：想做小时级的间隔，
+#: 顶到一天已经绰绰有余，再大只会让状态表变成假的。
+#: `state_tick` 的合法区间包含 0 与负数：那是文档里明确支持的"关掉心跳"写法。
+NUMERIC_LIMITS: Dict[str, Tuple[float, float, float]] = {
+    'check_interval': (0.1, 86400.0, 600.0),
+    'state_tick': (-86400.0, 86400.0, 5.0),
+    # 下限刻意取 0.05 而不是 1：亚秒级的阈值在测试与"快速验证配置"时是真会用到的
+    # （仓库自己的集成测试就用 0.2）。要挡的是 0 / 负数 / inf / nan / 超大 —— 0 会让
+    # `idle < timeout` 恒不成立，等于把自动休眠关掉却又不告诉任何人。
+    'idle_timeout': (0.05, 2592000.0, 3600.0),
+    'min_uptime': (0.0, 2592000.0, 300.0),
+    'startup_timeout': (1.0, 86400.0, 300.0),
+    'stop_timeout': (1.0, 86400.0, 180.0),
+    'port_release_timeout': (0.5, 86400.0, 60.0),
+    'wake_cooldown': (0.0, 86400.0, 15.0),
+    'fallback_startup_seconds': (0.1, 86400.0, 60.0),
+    'hot_startup_window': (0.0, 2592000.0, 300.0),
+    'player_attempt_window': (0.0, 2592000.0, 600.0),
+    'confirm_timeout': (5.0, 86400.0, 30.0),
+    'busy_hold_seconds': (0.0, 2592000.0, 300.0),
+    'bus.timeout': (0.1, 3600.0, 3.0),
+    # 次数类：非整数、0、负数、超大值都没有意义
+    'max_wake_failures': (1, 1000, 3),
+}
+
+
+def _valid_number(value, low: float, high: float) -> bool:
+    """值是不是"范围内的有限数"；bool 与字符串一律算非法（`True` 是 int 的子类）。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if value != value or value in (float('inf'), float('-inf')):    # nan / inf
+        return False
+    return low <= value <= high
+
+
+def sanitize_numbers(config) -> List[Tuple[str, object, object]]:
+    """把越界 / 非有限的数值配置改回默认值，返回 [(字段, 原值, 默认值)]。
+
+    就地修改 `config`（含 `config.bus.timeout` 这种子对象字段）。调用方负责记日志。
+    """
+    changed: List[Tuple[str, object, object]] = []
+    for name, (low, high, default) in NUMERIC_LIMITS.items():
+        owner, _, field = name.rpartition('.')
+        target = getattr(config, owner) if owner else config
+        if target is None:
+            continue
+        current = getattr(target, field, None)
+        if _valid_number(current, low, high):
+            continue
+        setattr(target, field, default)
+        changed.append((name, current, default))
+    return changed
 
 
 # --------------------------------------------------------------------------- #
