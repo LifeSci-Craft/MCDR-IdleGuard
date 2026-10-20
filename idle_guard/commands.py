@@ -627,7 +627,7 @@ def _cmd_action(source: CommandSource, supervisor: Supervisor, action: str, toke
     """
     if _unknown_target(source, supervisor, token):
         return
-    name = resolve_server(supervisor, token) or token
+    name = resolve_server(supervisor, token)
     by = _source_name(source, supervisor)
 
     if action in ('lock', 'unlock'):

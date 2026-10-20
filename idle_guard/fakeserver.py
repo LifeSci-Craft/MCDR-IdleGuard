@@ -272,7 +272,7 @@ class FakeServer:
 
     def _release(self, ip: str) -> None:
         with self._lock:
-            self._active = max(0, self._active - 1)
+            self._active -= 1
             rest = self._active_by_ip.get(ip, 0) - 1
             if rest > 0:
                 self._active_by_ip[ip] = rest

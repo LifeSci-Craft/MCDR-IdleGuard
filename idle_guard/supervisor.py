@@ -717,11 +717,10 @@ class Supervisor(TakeoverMixin, RemoteMixin):
     def velocity_status(self) -> Dict[str, object]:
         """velocity.toml 同步的状态，供 `!!ig check` 回显（读了哪个文件、读到几个子服）。
 
-        `state` 取值：`ok` / `disabled` / `not_found` / `missing_path` / `empty` / `error`；
-        还没跑过同步时是 `unknown`。
+        `state` 取值：`ok` / `disabled` / `not_found` / `missing_path` / `empty` / `error`。
+        `_sync_servers_from_velocity()` 在构造时就跑过，且每条路径都会写下这个属性。
         """
-        status = getattr(self, '_velocity_status', None)
-        return dict(status) if isinstance(status, dict) else {'state': 'unknown'}
+        return dict(self._velocity_status)
 
     def _save_config(self) -> None:
         """把当前配置写回 config.json（自动补过子服时用，好让管理员看得见改动）。
@@ -767,7 +766,8 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                 self._logger.warning(f'服务器 {entry.name} 的 role={entry.role!r} 非法，按 auto 处理')
                 self._invalid_roles.append((entry.name, entry.role))
                 entry.role = 'auto'
-            role = entry.role if entry.role in ('self', 'command', 'watch') else 'auto'
+            # 上面已经归一到 VALID_ROLES，这里直接用
+            role = entry.role
             if role == 'auto':
                 role = 'self' if entry.name == self_name else 'watch'
             if role in MANAGED_ROLES:
@@ -871,9 +871,9 @@ class Supervisor(TakeoverMixin, RemoteMixin):
         tick = self._config.state_tick
         # ≤0 = 关掉心跳（退回"只有侦察周期才更新状态"）；正数则至少 0.2 秒，别把 CPU 烧了
         interval = max(0.2, tick) if tick > 0 else self._config.check_interval
-        # 兜底夹取：数值校验（_sanitize_numbers）已经挡掉了 0 / inf / nan，这里再夹一道 —
-        # 万一以后有别的路径改配置，也不会让 Event.wait() 拿到一个离谱的值。
-        interval = min(max(interval, 0.1), _MAX_POLL_WAIT)
+        # 上界夹取：数值校验（_sanitize_numbers）已经挡掉了 0 / inf / nan，下界不必再夹一遍，
+        # 这里只负责不让 Event.wait() 一次睡过 _MAX_POLL_WAIT。
+        interval = min(interval, _MAX_POLL_WAIT)
         # 对端探测自己的节拍：**不能**挂在"心跳"上。tick ≤ 0 时下面 `full` 恒为真，
         # `_tick_states` 一次都不会跑，于是对端快照 / 健康度再没有更新来源 ——
         # 状态表里别人负责的服永远退回本地旧快照，跨实例等待状态也只能白等到超时。
@@ -1194,10 +1194,8 @@ class Supervisor(TakeoverMixin, RemoteMixin):
 
     def _port_open(self, managed: ManagedServer) -> bool:
         """便宜的"端口能不能连上"探测（不做完整的协议状态查询）。"""
-        try:
-            return port_open(managed.entry.host or '127.0.0.1', managed.entry.port, 1.0)
-        except Exception:  # noqa: BLE001
-            return False
+        # port_open 的契约是"不抛异常"（越界端口也已被它转成 False）
+        return port_open(managed.entry.host or '127.0.0.1', managed.entry.port, 1.0)
 
     def _set_state(self, managed: ManagedServer, state: State, detail: str = '') -> None:
         if managed.state == state and managed.detail == detail:
@@ -2241,8 +2239,7 @@ class Supervisor(TakeoverMixin, RemoteMixin):
                     )
                     self._remember_peer_snapshot(address, reply)
                 else:
-                    read_error = getattr(self._bus, 'last_error', None)
-                    reason = read_error(address) if callable(read_error) else ''
+                    reason = self._bus.last_error(address)
                     entry.update(ok=False, at=now, error=reason or '对端没有应答')
                     # 记一个"刚问过、但它不在线"的标记（servers 为空）：这样读命令知道
                     # "这个地址没有可用数据"，不必再同步去问一次 —— 它会退回本地旧快照，

@@ -188,10 +188,10 @@ class RemoteMixin:
         hint = self.tr('action.hint_auto' if role == 'auto' else 'action.hint_own',
                        server=server, role=role)
         # 连失败原因一起记：只说"没人应答"没法排查，得看清是连不上、鉴权失败还是对端没回
-        last_error = getattr(self._bus, 'last_error', None)
+        last_error = self._bus.last_error
         tried = []
         for address in addresses:
-            reason = last_error(address) if callable(last_error) else ''
+            reason = last_error(address)
             tried.append(f'{address}（{reason}）' if reason else address)
         self._logger.warning(self.tr('action.no_owner_none_answered', server=server, action=action,
                                       addresses='、'.join(tried) if tried else '无'))
@@ -214,9 +214,5 @@ class RemoteMixin:
         return False, self.tr('action.wait_timeout', server=server, seconds=int(timeout))
 
     def _lookup_view(self, server: str) -> Optional[ServerView]:
-        try:
-            return self.status_views().get(server)
-        except Exception as exc:  # noqa: BLE001
-            self._logger.debug(f'查询 {server} 状态失败：{type(exc).__name__}: {exc}')
-            return None
+        return self.status_views().get(server)
 
