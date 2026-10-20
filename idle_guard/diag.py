@@ -173,7 +173,7 @@ def _server_reason(sup: Supervisor, view) -> str:
         return tr('diag.server.reason.offline', instance=view.instance)
     if view.instance:
         return tr('diag.server.reason.remote', instance=view.instance)
-    if getattr(view, 'auto_sleep', True):
+    if view.auto_sleep:
         # 配着自动休眠却没人负责它 —— 这条配置永远生效不了，必须点出来
         return tr('diag.server.reason.watch_unowned')
     return tr('diag.server.reason.watch')
